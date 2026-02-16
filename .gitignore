@@ -1,0 +1,7 @@
+# Folders to ignore (add a slash at the end)
+checkpoints/
+*/__pycache__/
+
+# Sensitive info
+.env
+*.log
