@@ -51,11 +51,11 @@ class ContinuousVPSDE(DiffusionProcess):
         
         return loss_mse, x0_pred
 
-    def ddpm_step(self, model: torch.nn.Module, x_t: torch.Tensor, t: torch.Tensor, batch_vec: torch.Tensor, edge_index: torch.Tensor,edge_weight: torch.Tensor, field: torch.Tensor) -> torch.Tensor:
+    def ddpm_step(self, model: torch.nn.Module, x_t: torch.Tensor, t: torch.Tensor, batch_vec: torch.Tensor, edge_index: torch.Tensor, field: torch.Tensor) -> torch.Tensor:
         # real_model = model.module if hasattr(model, 'module') else model
         # temb = real_model.time_emb(t.float())
         x_input = torch.cat([x_t, field], dim=1)
-        eps_pred = model(x_input, edge_index,edge_weight, batch_vec, t.float()).reshape(-1, 1)
+        eps_pred = model(x_input, edge_index, batch_vec, t.float()).reshape(-1, 1)
 
         t_val = t[0]
         alpha_bar_t = self.alphacum_t[t_val]
@@ -74,10 +74,10 @@ class ContinuousVPSDE(DiffusionProcess):
             return posterior_mean + torch.exp(0.5 * torch.log(posterior_var.clamp(min=1e-20))) * noise
         return posterior_mean
 
-    def ddim_step(self, model: torch.nn.Module, x_t: torch.Tensor, t: torch.Tensor, t_next: torch.Tensor, batch_vec: torch.Tensor, edge_index: torch.Tensor,edge_weight: torch.Tensor, field: torch.Tensor, eta: float) -> torch.Tensor:
+    def ddim_step(self, model: torch.nn.Module, x_t: torch.Tensor, t: torch.Tensor, t_next: torch.Tensor, batch_vec: torch.Tensor, edge_index: torch.Tensor, field: torch.Tensor, eta: float) -> torch.Tensor:
         # temb = model.time_emb(t.float())
         # x_input = torch.cat([x_t, field], dim=1)
-        eps_pred = model(x_input, edge_index,edge_weight, batch_vec, t.float()).reshape(-1, 1)
+        eps_pred = model(x_input, edge_index, batch_vec, t.float()).reshape(-1, 1)
 
         t_val, t_next_val = t[0], t_next[0]
         alpha_t = self.alphacum_t[t_val]

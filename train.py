@@ -107,14 +107,15 @@ def parse_args():
     parser.add_argument("--batch_size_val", type=int, default=512)
     parser.add_argument("--save_path", type=str, default="./checkpoints")
     parser.add_argument("--discrete", action="store_true", help="Use D3PM instead of Continuous SDE")
-    parser.add_argument("--lr", type=float, default=0.0002)
+    parser.add_argument("--lr", type=float, default=0.004)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--rank", type=int, required=True)
+    parser.add_argument("--grad_acc", type=int, default=2)
     return parser.parse_args()
 
 def main():
     args = parse_args()
-    accelerator = Accelerator(mixed_precision="fp16")
+    accelerator = Accelerator(mixed_precision="fp16",gradient_accumulation_steps=args.grad_acc)
     device = accelerator.device
 
     betas_schedule = get_cosine_schedule(args.timesteps)
@@ -149,7 +150,7 @@ def main():
 
     # ds = MyDataset(data, mk.reshape(N, 1), edge_index, edge_weight)
     # ds = torch.load("/mnt/beegfs/2a/sb12724/rfim_learn_fields/processed_dataset_L12.pt")
-    ds = MultiFieldIsingDataset(load_path="/mnt/beegfs/2a/sb12724/rfim_learn_fields/processed_dataset_L12.pt", augment=True)
+    ds = MultiFieldIsingDataset(load_path=args.data_path, augment=False)
     train_size = int(0.8 * len(ds))
     val_size = len(ds) - train_size
     train_ds, val_ds = random_split(ds, [train_size, val_size])

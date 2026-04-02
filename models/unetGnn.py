@@ -69,7 +69,14 @@ class GNNLayer(nn.Module):
         nn.init.zeros_(self.t_proj[1].bias)
         
         self.f_proj = nn.Linear(1, in_ch * 2, bias=False)
+        # self.f_proj = nn.Sequential(
+        #     nn.Linear(1, in_ch),
+        #     nn.SiLU(),
+        #     nn.Linear(in_ch, in_ch * 2)
+        # )
         nn.init.zeros_(self.f_proj.weight)
+        # nn.init.zeros_(self.f_proj[2].weight)
+        # nn.init.zeros_(self.f_proj[2].bias)
         
         self.conv0 = GraphConv(in_ch, in_ch, bias=False)
         self.act = nn.SiLU()

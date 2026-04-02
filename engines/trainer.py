@@ -44,21 +44,22 @@ class IsingTrainer:
         self.model.train()
         B = batch.batch_size
         time_idx = torch.randint(0, self.process.timesteps - 1, (B,), device=self.device)
-        
-        with self.accelerator.autocast():
-            # 1. Ask the Process for the primary loss and the predicted clean state
-            base_loss, x0_pred = self.process.compute_loss(self.model, batch, time_idx)
-            
-            # 2. Enforce Physical Constraints
-            loss_edge = self.correlation_loss(x0_pred.sign(), batch.x, batch.edge_index)
-            loss = base_loss + 0.5 * loss_edge
+        with self.accelerator.accumulate(self.model):    
+            with self.accelerator.autocast():
+                # 1. Ask the Process for the primary loss and the predicted clean state
+                base_loss, x0_pred = self.process.compute_loss(self.model, batch, time_idx)
+                
+                # 2. Enforce Physical Constraints
+                loss_edge = self.correlation_loss(x0_pred.sign(), batch.x, batch.edge_index)
+                loss = base_loss + 0.5 * loss_edge
+                # loss = base_loss
 
-        self.accelerator.backward(loss)
+            self.accelerator.backward(loss)
         
-        if self.accelerator.sync_gradients:
-            self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
-            self.optimizer.step()
-            self.optimizer.zero_grad(set_to_none=True)
+        # if self.accelerator.sync_gradients:
+            # self.accelerator.clip_grad_norm_(self.model.parameters(), 1.0)
+            # self.optimizer.step()
+            # self.optimizer.zero_grad(set_to_none=True)
             
         return loss.detach().item()
 
@@ -90,7 +91,7 @@ class IsingTrainer:
                 
                 # 2. Log intermediate step checkpoints (e.g., every 5000 steps)
                 # You can change mode to "log" for logarithmic saving
-                self.tracker.log_step(global_step, self.model, mode="linear", interval=5000)
+                self.tracker.log_step(global_step, self.model, mode="linear", interval=50)
             
             self.scheduler.step()
 

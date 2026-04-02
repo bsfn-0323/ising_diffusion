@@ -55,23 +55,25 @@ def main():
     N = L * L
     # data_dir = os.path.dirname(data_path)
     jmat_path = os.path.join(data_path, "Jmat.bin")
+    h_path = os.path.join(data_path,"hrandom.bin")
     config_path = os.path.join(data_path, f"config_rank{train_args.get('rank')}.bin")
     
     data_raw = np.fromfile(config_path, dtype=np.int32).reshape(-1, N, 1)
     mk = data_raw.mean(0)
     
     Js_raw = np.fromfile(jmat_path, dtype=np.int32).reshape(N, N)
+    h = np.fromfile(h_path).reshape(N)
     edge_index = torch.from_numpy(np.stack(np.nonzero(Js_raw))).long()
     if edge_index.shape[0] != 2:
         edge_index = edge_index.t().contiguous()
-    edge_weight = torch.full((edge_index.size(1), 1), 1.0)
+    # edge_weight = torch.full((edge_index.size(1), 1), 1.0)
 
     # 4. Sampling
     sampler = IsingSampler(model=model, process=process, device=device, accelerator=accelerator)
     sampling_kwargs = {
         "edge_index_single": edge_index,
-        "edge_weight_single": edge_weight,
-        "field_single": torch.from_numpy(mk).float()
+        # "edge_weight_single": edge_weight,
+        "field_single": torch.from_numpy(h).float()
     }
 
     print(f"[*] Starting {method.upper()} Distributed Sampling...")

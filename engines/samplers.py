@@ -11,7 +11,7 @@ class IsingSampler:
         self.accelerator = accelerator
         # self.N = model.size
 
-    def _prepare_batch(self, batch_size: int, edge_index_single: torch.Tensor,edge_weight_single: torch.Tensor, field_single: torch.Tensor):
+    def _prepare_batch(self, batch_size: int, edge_index_single: torch.Tensor, field_single: torch.Tensor):
         N = field_single.shape[0]
         # Ensure field is (N, 1) before expanding
         field_single = field_single.reshape(N, 1).to(self.device)
@@ -27,15 +27,17 @@ class IsingSampler:
         
         offset = (torch.arange(batch_size, device=self.device) * N).view(-1, 1, 1)
         edge_index = (edge_index_single.to(self.device).unsqueeze(0) + offset).permute(1, 0, 2).reshape(2, -1)
-        edge_weight = edge_weight_single.to(self.device).repeat(batch_size, 1)
+        # edge_weight = edge_weight_single.to(self.device).repeat(batch_size, 1)
         batch_vec = torch.arange(batch_size, device=self.device).repeat_interleave(N)
         
-        return x, field_expand, edge_index,edge_weight, batch_vec,N
+        return x, field_expand, edge_index, batch_vec,N
+        # return x, field_expand, edge_index,edge_weight, batch_vec,N
 
     @torch.no_grad()
-    def sample_ddpm(self, batch_size: int, edge_index_single: torch.Tensor,edge_weight_single: torch.Tensor, field_single: torch.Tensor):
+    def sample_ddpm(self, batch_size: int, edge_index_single: torch.Tensor, field_single: torch.Tensor):
         """Standard Ancestral Sampling abstracted through the Process interface."""
-        x, field_expand, edge_index,edge_weight, batch_vec,N = self._prepare_batch(batch_size, edge_index_single,edge_weight_single, field_single)
+        # x, field_expand, edge_index,edge_weight, batch_vec,N = self._prepare_batch(batch_size, edge_index_single,edge_weight_single, field_single)
+        x, field_expand, edge_index, batch_vec,N = self._prepare_batch(batch_size, edge_index_single, field_single)
 
         start_time = time.perf_counter()
         for i in tqdm(reversed(range(0, self.process.timesteps)), desc="DDPM Sampling", leave=False):
@@ -44,15 +46,17 @@ class IsingSampler:
             # Delegate the mathematical step to the process
             x = self.process.ddpm_step(
                 model=self.model, x_t=x, t=t, 
-                batch_vec=batch_vec, edge_index=edge_index,edge_weight=edge_weight, field=field_expand
+                batch_vec=batch_vec, edge_index=edge_index, field=field_expand
             )
 
         print(f"Sampling finished in {time.perf_counter() - start_time:.4f}s")
         return x.view(batch_size, N, 1)
 
     @torch.no_grad()
-    def sample_ddim(self, batch_size: int, num_steps: int, edge_index_single: torch.Tensor,edge_weight_single: torch.Tensor, field_single: torch.Tensor, eta: float = 0.0):
-        x, field_expand, edge_index,edge_weight, batch_vec,N = self._prepare_batch(batch_size, edge_index_single,edge_weight_single, field_single)
+    def sample_ddim(self, batch_size: int, num_steps: int, edge_index_single: torch.Tensor, field_single: torch.Tensor, eta: float = 0.0):
+        x, field_expand, edge_index, batch_vec,N = self._prepare_batch(batch_size, edge_index_single, field_single)
+        # x, field_expand, edge_index,edge_weight, batch_vec,N = self._prepare_batch(batch_size, edge_index_single,edge_weight_single, field_single)
+        
         taus = np.linspace(self.process.timesteps - 1, 0, num_steps, dtype=int)
 
         for i in tqdm(range(len(taus) - 1), desc="DDIM Sampling", leave=False):
@@ -63,14 +67,15 @@ class IsingSampler:
             # Delegate to the process
             x = self.process.ddim_step(
                 model=self.model, x_t=x, t=t_tensor, t_next=t_next_tensor, 
-                batch_vec=batch_vec, edge_index=edge_index,edge_weight=edge_weight, field=field_expand, eta=eta
+                batch_vec=batch_vec, edge_index=edge_index, field=field_expand, eta=eta
             )
 
         return x.view(batch_size, N, 1)
     
     @torch.no_grad()
-    def sample_d3pm(self, batch_size: int, edge_index_single: torch.Tensor, edge_weight_single: torch.Tensor, field_single: torch.Tensor):
-        x, field_expand, edge_index, edge_weight, batch_vec, N = self._prepare_batch(batch_size, edge_index_single, edge_weight_single, field_single)
+    def sample_d3pm(self, batch_size: int, edge_index_single: torch.Tensor, field_single: torch.Tensor):
+        # x, field_expand, edge_index, edge_weight, batch_vec, N = self._prepare_batch(batch_size, edge_index_single, edge_weight_single, field_single)
+        x, field_expand, edge_index, batch_vec, N = self._prepare_batch(batch_size, edge_index_single, field_single)
 
         start_time = time.perf_counter()
         for i in tqdm(reversed(range(0, self.process.timesteps)), desc="D3PM Sampling", leave=False):
@@ -79,7 +84,7 @@ class IsingSampler:
             # Call the newly named d3pm_step
             x = self.process.d3pm_step(
                 model=self.model, x_t=x, t=t, 
-                batch_vec=batch_vec, edge_index=edge_index, edge_weight=edge_weight, field=field_expand
+                batch_vec=batch_vec, edge_index=edge_index,field=field_expand
             )
 
         print(f"Sampling finished in {time.perf_counter() - start_time:.4f}s")

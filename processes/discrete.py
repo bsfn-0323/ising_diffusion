@@ -129,7 +129,7 @@ class D3PMProcess(DiffusionProcess):
         # 2. Model Prediction (BCE Setup)
         x_input = torch.cat([xt_physical, batch.field], dim=1)
         # Squeeze the (N, 1) output to (N,)
-        logits = model(x_input, batch.edge_index, batch.edge_weight, batch.batch, t.float()).float().squeeze(-1)
+        logits = model(x_input, batch.edge_index, batch.batch, t.float()).float().squeeze(-1)
         
         # Reconstruct full probability distribution for KL Divergence
         p_plus = torch.sigmoid(logits) 
@@ -170,13 +170,13 @@ class D3PMProcess(DiffusionProcess):
 
         return total_loss, self._idx_to_spin(x0_pred_idx)
 
-    def d3pm_step(self, model, x_t, t, batch_vec, edge_index, edge_weight, field):
+    def d3pm_step(self, model, x_t, t, batch_vec, edge_index, field):
         xt_idx = self._spin_to_idx(x_t)
         N = len(xt_idx)
         idx_arange = torch.arange(N, device=self.device)
         
         x_input = torch.cat([x_t, field], dim=1)
-        logits = model(x_input, edge_index, edge_weight, batch_vec, t.float()).float().squeeze(-1)
+        logits = model(x_input, edge_index, batch_vec, t.float()).float().squeeze(-1)
         
         p_plus = torch.sigmoid(logits)
         p_theta_x0 = torch.stack([1.0 - p_plus, p_plus], dim=-1)
