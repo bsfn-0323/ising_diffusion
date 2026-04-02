@@ -82,7 +82,7 @@ class GNNLayer(nn.Module):
             
         self.shortcut = nn.Linear(in_ch, out_ch, bias=False) if in_ch != out_ch else nn.Identity()
 
-    def forward(self, x, edge_index,edge_weight, batch, t_vec, field):
+    def forward(self, x, edge_index, batch, t_vec, field):
         x_in = x
         
         # MUST pass batch here now for dynamic pooling
@@ -100,9 +100,9 @@ class GNNLayer(nn.Module):
         if not self.encoder:
             x = x + self.mlp(x)
 
-        x = self.conv0(x, edge_index,edge_weight.view(-1))
+        x = self.conv0(x, edge_index)
         x = self.act(x)
-        x = self.conv1(x, edge_index,edge_weight.view(-1))
+        x = self.conv1(x, edge_index)
         
         return x + self.shortcut(x_in)
 
@@ -112,7 +112,7 @@ class GNNUnet(nn.Module):
         super().__init__()
         self.layer_len = len(ch_mult)
         self.time_emb_dim = time_emb_dim
-        
+        self.base_ch =base_ch
         self.time_emb = nn.Sequential(
             SinusoidalPositionEmbeddings(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim * 2, bias=False),
@@ -138,11 +138,11 @@ class GNNUnet(nn.Module):
         if not discrete:
             self.out_conv = nn.Linear(base_ch + 1, 1, bias=True)
         else:
-            self.out_conv = nn.Linear(base_ch + 1, 2, bias=True)
+            self.out_conv = nn.Linear(base_ch + 1, 1, bias=True)
             
         self.act = nn.SiLU()
 
-    def forward(self, x_in, edge_index,edge_weight, batch, t):
+    def forward(self, x_in, edge_index, batch, t):
         t_vec = self.time_emb(t)
         field = x_in[:, -1].unsqueeze(-1)
         
@@ -150,15 +150,15 @@ class GNNUnet(nn.Module):
         
         x_residual = []
         for layer in self.encoder:
-            x = layer(x, edge_index,edge_weight, batch, t_vec, field)
+            x = layer(x, edge_index, batch, t_vec, field)
             x_residual.append(x)
 
-        x = self.latent(x, edge_index,edge_weight, batch, t_vec, field)
+        x = self.latent(x, edge_index, batch, t_vec, field)
         
         for i, layer in enumerate(self.decoder):
             res = x_residual[-(i + 1)]
             x = x + res 
-            x = layer(x.contiguous(), edge_index,edge_weight, batch, t_vec, field)
+            x = layer(x.contiguous(), edge_index, batch, t_vec, field)
 
         # Final norm needs batch vector too
         x = self.final_norm(x, batch)

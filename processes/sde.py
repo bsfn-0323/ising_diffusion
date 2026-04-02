@@ -40,7 +40,7 @@ class ContinuousVPSDE(DiffusionProcess):
         x_input = torch.cat([x_noised, batch.field], dim=1)
         
         # temb = model.time_emb(t.float())
-        noise_pred = model(x_input, batch.edge_index,batch.edge_weight, batch.batch, t).reshape(noise.shape[0], 1)
+        noise_pred = model(x_input, batch.edge_index, batch.batch, t).reshape(noise.shape[0], 1)
         
         loss_mse = F.mse_loss(noise_pred, noise)
         

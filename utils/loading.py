@@ -16,14 +16,15 @@ def load_model_from_checkpoint(checkpoint_dir, device, load_best=False):
         config = json.load(f)
     
     arch = config["architecture"]
-    
+    train_args = config.get("training_params",{})
     # 2. Reconstruct Architecture
     # Ensure these keys match what the ExperimentTracker saved
+    print(arch)
     model = GNNUnet(
         base_ch=arch["base_ch"],
-        ch_mult=[1, 2, 4], # This was hardcoded in main, but you could save it too
+        ch_mult=arch["ch_mult"], # This was hardcoded in main, but you could save it too
         time_emb_dim=arch["time_emb_dim"],
-        # discrete=arch.get("discrete_mode", True) 
+        discrete=arch.get("discrete_mode", True) 
     )
     
     # 3. Choose which weights to load
