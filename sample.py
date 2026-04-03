@@ -17,6 +17,9 @@ def parse_args():
     parser.add_argument("--num_samples", type=int, default=8192, help="Total samples to generate")
     parser.add_argument("--batch_size", type=int, default=2048, help="Max VRAM batch size per GPU")
     parser.add_argument("--load_best", action="store_true", help="Load model_best.pt instead of model_last.pt")
+    parser.add_argument("--truedata_path", type=str, required=True)
+    parser.add_argument("--out_path",type=str,default=None)
+    parser.add_argument("--rep",type=int,default=None)
     return parser.parse_args()
 
 def main():
@@ -47,7 +50,8 @@ def main():
         method = 'ddpm'
 
     # 3. Data Preparation from Config
-    data_path = train_args.get("data_path")
+    # data_path = train_args.get("data_path")
+    data_path = args.truedata_path
     if not data_path or not os.path.exists(data_path):
         raise ValueError(f"Valid data_path not found in config.json: {data_path}")
         
@@ -73,7 +77,7 @@ def main():
     sampling_kwargs = {
         "edge_index_single": edge_index,
         # "edge_weight_single": edge_weight,
-        "field_single": torch.from_numpy(h).float()
+        "field_single": torch.from_numpy(mk).float()
     }
 
     print(f"[*] Starting {method.upper()} Distributed Sampling...")
@@ -87,21 +91,28 @@ def main():
     # 5. Save Results to Checkpoint Folder
     if accelerator.is_main_process:
         final_spins = generated_spins.to(device)
-        samples_path = os.path.join(args.checkpoint_path, "generated_samples.bin")
-        final_spins.cpu().numpy().astype(np.float32).tofile(samples_path)
+        if args.out_path is not None:
+            sample_dir = os.path.join(args.checkpoint_path,args.out_path)
+            os.makedirs(sample_dir, exist_ok=True)
+            samples_path = os.path.join(sample_dir,f"gen_L{train_args.get('L')}_rank{train_args.get('rank')}_r{args.rep}.bin")
+            plot_path = os.path.join(sample_dir, f"magn_L{train_args.get('L')}_rank{train_args.get('rank')}_r{args.rep}.pdf")
+        else:
+            samples_path = os.path.join(args.checkpoint_path, "gen_samples.bin")
+            plot_path = os.path.join(args.checkpoint_path, f"magn_pdf_{method}.pdf")
+        final_spins.cpu().numpy().astype(np.int8).tofile(samples_path)
         
         plt.figure(figsize=(8, 5))
         m_gen = final_spins.sign().reshape(-1, N).cpu().mean(-1)
         m_true = data_raw[:min(args.num_samples, len(data_raw))].reshape(-1, N).mean(-1)
 
-        plt.hist(m_gen, bins=31, range=(-1, 1), alpha=0.5, density=True, label="Generated")
-        plt.hist(m_true, bins=31, range=(-1, 1), alpha=0.5, density=True, label="True Data")
+        plt.hist(m_gen, bins=21, range=(-1, 1), alpha=0.5, density=True, label="Generated")
+        plt.hist(m_true, bins=21, range=(-1, 1), alpha=0.5, density=True, label="True Data")
         plt.title(f"Magnetization PDF: {method.upper()} vs True Data")
         plt.xlabel("Magnetization M")
         plt.ylabel("Density")
         plt.legend()
         
-        plot_path = os.path.join(args.checkpoint_path, f"magn_pdf_{method}.pdf")
+        
         plt.savefig(plot_path)
         plt.close()
         

@@ -120,6 +120,7 @@ class GNNUnet(nn.Module):
         self.layer_len = len(ch_mult)
         self.time_emb_dim = time_emb_dim
         self.base_ch =base_ch
+        self.ch_mult=ch_mult
         self.time_emb = nn.Sequential(
             SinusoidalPositionEmbeddings(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim * 2, bias=False),

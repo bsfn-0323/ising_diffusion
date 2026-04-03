@@ -115,7 +115,7 @@ def parse_args():
 
 def main():
     args = parse_args()
-    accelerator = Accelerator(mixed_precision="fp16",gradient_accumulation_steps=args.grad_acc)
+    accelerator = Accelerator(mixed_precision="fp16")
     device = accelerator.device
 
     betas_schedule = get_cosine_schedule(args.timesteps)
@@ -168,7 +168,7 @@ def main():
         args=exp_args
     )
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader) * args.epochs, eta_min=args.lr/100)
 
     model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
