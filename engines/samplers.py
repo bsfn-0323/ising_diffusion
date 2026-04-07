@@ -89,6 +89,36 @@ class IsingSampler:
 
         print(f"Sampling finished in {time.perf_counter() - start_time:.4f}s")
         return x.view(batch_size, N, 1)
+    
+    @torch.no_grad()
+    def sample_d3pm_conditional(self, batch_size: int, edge_index_single: torch.Tensor, field_single: torch.Tensor, mask_single: torch.Tensor, x0_fixed_single: torch.Tensor):
+        x, field_expand, edge_index, batch_vec, N = self._prepare_batch(batch_size, edge_index_single, field_single)
+        
+        # Expand masks and fixed states across the batch dimension
+        mask_expand = mask_single.to(self.device).unsqueeze(1).repeat(batch_size, 1)
+        x0_fixed_expand = x0_fixed_single.to(self.device).repeat(batch_size, 1)
+        
+        start_time = time.perf_counter()
+        for i in tqdm(reversed(range(0, self.process.timesteps)), desc="D3PM Conditional Sampling", leave=False):
+            t = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
+            
+            # 1. Enforce known boundary state at noise level t
+            x_known = self.process.q_sample(x0_fixed_expand, t, batch_vec)
+            
+            # 2. Overwrite the boundary nodes (False in mask) with the known noisy state
+            x = torch.where(mask_expand, x, x_known)
+            
+            # 3. Predict the next less-noisy state using the GNN
+            x = self.process.d3pm_step(
+                model=self.model, x_t=x, t=t, 
+                batch_vec=batch_vec, edge_index=edge_index, field=field_expand
+            )
+
+        # 4. Final step: Ensure the boundary exactly matches the clean ground truth
+        x = torch.where(mask_expand, x, x0_fixed_expand)
+
+        print(f"Sampling finished in {time.perf_counter() - start_time:.4f}s")
+        return x.view(batch_size, N, 1)
 
     @torch.no_grad()
     def sample_distributed(self, total_samples: int, method: str, max_vram_batch: int = 256, **kwargs):
@@ -99,11 +129,21 @@ class IsingSampler:
         if self.accelerator is None:
             raise ValueError("Accelerator required.")
 
+        # If using batched conditioning, extract them from kwargs
+        if method == 'd3pm_cond_batched':
+            full_x0_batch = kwargs.pop('x0_fixed_batch')
+            # full_field_batch = kwargs.pop('field_batch')
+            
         # 1. Determine local workload
         indices = list(range(total_samples))
         with self.accelerator.split_between_processes(indices) as local_indices:
             n_local = len(local_indices)
 
+        # IMPORTANT: Slice the full batched conditions to match the GPU's local workload
+            if method == 'd3pm_cond_batched':
+                local_x0 = full_x0_batch[local_indices]
+                # local_field = full_field_batch[local_indices]
+                
         local_results = []
         
         # 2. Sequential Chunking: Process n_local in small pieces
@@ -115,6 +155,19 @@ class IsingSampler:
                 chunk = self.sample_d3pm(batch_size=current_batch_size, **kwargs)
             elif method == 'ddpm':
                 chunk = self.sample_ddpm(batch_size=current_batch_size, **kwargs)
+            elif method == 'd3pm_bound_cond':
+                chunk = self.sample_d3pm_conditional(batch_size=current_batch_size, **kwargs)
+            elif method == 'd3pm_cond_batched':
+                # Slice the exact sub-chunk for this VRAM pass
+                chunk_x0 = local_x0[i : i + current_batch_size]
+                
+                chunk = self.sample_d3pm_conditional_batched(
+                    batch_size=current_batch_size,
+                    edge_index_single=kwargs['edge_index_single'],
+                    mask_single=kwargs['mask_single'],
+                    field_single=kwargs['field_single'],
+                    x0_fixed_batch=chunk_x0
+                )
             
             # Move to CPU immediately to free up VRAM for the next chunk
             local_results.append(chunk.cpu()) 
@@ -140,3 +193,89 @@ class IsingSampler:
 
         # Trim padding if necessary
         return all_samples[:total_samples]
+    
+    # @torch.no_grad()
+    # def sample_d3pm_conditional_batched(self, batch_size: int, edge_index_single: torch.Tensor, mask_single: torch.Tensor, field_single: torch.Tensor, x0_fixed_batch: torch.Tensor):
+    #     """
+    #     batch_size: Number of samples in this VRAM chunk
+    #     field_single: Tensor [N, 1] (Static field for the subgraph)
+    #     x0_fixed_batch: Tensor [B, N, 1] (Different boundary conditions per sample)
+    #     """
+    #     N = field_single.shape[0]
+        
+    #     # 1. Prepare Graph Topology (Shared across batch)
+    #     offset = (torch.arange(batch_size, device=self.device) * N).view(-1, 1, 1)
+    #     edge_index = (edge_index_single.to(self.device).unsqueeze(0) + offset).permute(1, 0, 2).reshape(2, -1)
+    #     batch_vec = torch.arange(batch_size, device=self.device).repeat_interleave(N)
+        
+    #     # 2. Expand Shared Conditions
+    #     mask_expand = mask_single.to(self.device).unsqueeze(1).repeat(batch_size, 1)
+    #     field_expand = field_single.to(self.device).repeat(batch_size, 1)
+        
+    #     # 3. Flatten Unique Batched Boundaries to [B*N, 1]
+    #     x0_fixed_expand = x0_fixed_batch.to(self.device).view(batch_size * N, 1)
+
+    #     # Initialize full noise for the batch
+    #     x = (torch.randint(0, self.process.K, (batch_size * N, 1), device=self.device) * 2 - 1).float()
+
+    #     start_time = time.perf_counter()
+    #     for i in tqdm(reversed(range(0, self.process.timesteps)), desc="Batched Cond Sampling", leave=False):
+    #         t = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
+            
+    #         # Forward diffuse the unique batched boundary states
+    #         x_known = self.process.q_sample(x0_fixed_expand, t, batch_vec)
+            
+    #         # Enforce the unique boundaries for each sample
+    #         x = torch.where(mask_expand, x, x_known)
+            
+    #         # Neural Network Step (using the shared expanded field)
+    #         x = self.process.d3pm_step(
+    #             model=self.model, x_t=x, t=t, 
+    #             batch_vec=batch_vec, edge_index=edge_index, field=field_expand
+    #         )
+
+    #     # Final cleanup to ensure exact matching of boundaries
+    #     x = torch.where(mask_expand, x, x0_fixed_expand)
+
+    #     # print(f"Sampling finished in {time.perf_counter() - start_time:.4f}s")
+    #     return x.view(batch_size, N, 1)
+    def sample_d3pm_conditional_batched(self, batch_size: int, edge_index_single: torch.Tensor, mask_single: torch.Tensor, field_single: torch.Tensor, x0_fixed_batch: torch.Tensor):
+        # Infer N from the first dimension
+        N = field_single.shape[0]
+        
+        # 1. Prepare Graph Topology
+        offset = (torch.arange(batch_size, device=self.device) * N).view(-1, 1, 1)
+        edge_index = (edge_index_single.to(self.device).unsqueeze(0) + offset).permute(1, 0, 2).reshape(2, -1)
+        batch_vec = torch.arange(batch_size, device=self.device).repeat_interleave(N)
+        
+        # 2. Expand Shared Conditions (FIXED)
+        # Force field and mask into [N, 1] before repeating to avoid [B, N] broadcast errors
+        mask_expand = mask_single.to(self.device).view(-1, 1).repeat(batch_size, 1)
+        field_expand = field_single.to(self.device).view(-1, 1).repeat(batch_size, 1)
+        
+        # 3. Flatten Unique Batched Boundaries to [B*N, 1]
+        x0_fixed_expand = x0_fixed_batch.to(self.device).view(batch_size * N, 1)
+
+        # Initialize full noise for the batch
+        x = (torch.randint(0, self.process.K, (batch_size * N, 1), device=self.device) * 2 - 1).float()
+
+        start_time = time.perf_counter()
+        for i in tqdm(reversed(range(0, self.process.timesteps)), desc="Batched Cond Sampling", leave=False):
+            t = torch.full((batch_size,), i, device=self.device, dtype=torch.long)
+            
+            # Forward diffuse the unique batched boundary states
+            x_known = self.process.q_sample(x0_fixed_expand, t, batch_vec)
+            
+            # Enforce the unique boundaries for each sample
+            x = torch.where(mask_expand, x, x_known)
+            
+            # Neural Network Step
+            x = self.process.d3pm_step(
+                model=self.model, x_t=x, t=t, 
+                batch_vec=batch_vec, edge_index=edge_index, field=field_expand
+            )
+
+        # Final cleanup to ensure exact matching of boundaries
+        x = torch.where(mask_expand, x, x0_fixed_expand)
+
+        return x.view(batch_size, N, 1)

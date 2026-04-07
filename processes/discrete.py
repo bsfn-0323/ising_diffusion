@@ -201,6 +201,21 @@ class D3PMProcess(DiffusionProcess):
             
         xt_prev_idx = torch.multinomial(p_theta_xt_prev, num_samples=1).squeeze()
         return self._idx_to_spin(xt_prev_idx)
+    
+    def q_sample(self, x_0: torch.Tensor, t: torch.Tensor, batch_vec: torch.Tensor) -> torch.Tensor:
+        """Forward diffuses clean fixed spins x_0 to time t."""
+        x0_idx = self._spin_to_idx(x_0)
+        idx_arange = torch.arange(len(x0_idx), device=self.device)
+        
+        # Retrieve the cumulative transition matrices for the batch
+        q_bar_t_batch = self.Q_bar_t[t[batch_vec]]
+        
+        # Get transition probabilities for the specific clean state
+        p_xt = q_bar_t_batch[idx_arange, x0_idx]
+        
+        # Sample the noisy fixed state
+        xt_idx = torch.multinomial(p_xt, num_samples=1).squeeze()
+        return self._idx_to_spin(xt_idx)
 
     def ddpm_step(self, *args, **kwargs):
         raise NotImplementedError("For discrete processes, use d3pm_step instead of ddpm_step.")
