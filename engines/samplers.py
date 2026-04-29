@@ -168,6 +168,24 @@ class IsingSampler:
                     field_single=kwargs['field_single'],
                     x0_fixed_batch=chunk_x0
                 )
+            # elif method == 'd3pm_repaint_cond':
+            #     chunk = self.sample_d3pm_repaint_conditional(
+            #         batch_size=current_batch_size, 
+            #         jump_len=20, 
+            #         jump_n_sample=20, 
+            #         **kwargs
+            #     )
+            elif method == 'd3pm_repaint_cond':
+                chunk = self.sample_d3pm_repaint_optimized(
+                    batch_size=current_batch_size, 
+                    edge_index_single=kwargs['edge_index_single'],
+                    field_single=kwargs['field_single'],
+                    mask_single=kwargs['mask_single'],
+                    x0_fixed_single=kwargs['x0_fixed_single'],
+                    jump_len=5, 
+                    jump_n_sample=5, 
+                    t_jump_threshold=800  # Triggers time-travel only for t < 100
+                )
             
             # Move to CPU immediately to free up VRAM for the next chunk
             local_results.append(chunk.cpu()) 
@@ -278,4 +296,124 @@ class IsingSampler:
         # Final cleanup to ensure exact matching of boundaries
         x = torch.where(mask_expand, x, x0_fixed_expand)
 
+        return x.view(batch_size, N, 1)
+    
+    @torch.no_grad()
+    def sample_d3pm_repaint_conditional(self, batch_size: int, edge_index_single: torch.Tensor, field_single: torch.Tensor, mask_single: torch.Tensor, x0_fixed_single: torch.Tensor, jump_len: int = 10, jump_n_sample: int = 10):
+        # 1. Prepare standard batch
+        x, field_expand, edge_index, batch_vec, N = self._prepare_batch(batch_size, edge_index_single, field_single)
+        
+        # Expand single condition mask and fixed states across the batch dimension
+        mask_expand = mask_single.to(self.device).unsqueeze(1).repeat(batch_size, 1)
+        x0_fixed_expand = x0_fixed_single.to(self.device).repeat(batch_size, 1)
+        
+        # 2. Compute RePaint Schedule
+        schedule = []
+        t = self.process.timesteps - 1
+        jumps = {}
+        for j in range(0, self.process.timesteps - jump_len, jump_len):
+            jumps[j] = jump_n_sample - 1
+            
+        while t >= 0:
+            schedule.append(("backward", t))
+            t -= 1
+            # Time Travel: Step forward 'jump_len' times if we hit a jump point
+            if t in jumps and jumps[t] > 0:
+                jumps[t] -= 1
+                for _ in range(jump_len):
+                    t += 1
+                    schedule.append(("forward", t))
+
+        start_time = time.perf_counter()
+        
+        # 3. Execute Schedule
+        for op, t_val in tqdm(schedule, desc="RePaint Conditional", leave=False):
+            t_tensor = torch.full((batch_size,), t_val, device=self.device, dtype=torch.long)
+            
+            if op == "backward":
+                # Enforce known boundary state at noise level t
+                x_known = self.process.q_sample(x0_fixed_expand, t_tensor, batch_vec)
+                x = torch.where(mask_expand, x, x_known)
+                
+                # Predict the next less-noisy state using the GNN
+                x = self.process.d3pm_step(
+                    model=self.model, x_t=x, t=t_tensor, 
+                    batch_vec=batch_vec, edge_index=edge_index, field=field_expand
+                )
+            
+            elif op == "forward":
+                # Forward Noise Step (t-1 -> t) using the 1-step discrete matrix Q_t
+                idx_prev = self.process._spin_to_idx(x)
+                q_t = self.process.Q_t[t_val] # Shape: [2, 2]
+                
+                # Get transition probabilities and sample
+                p_xt = q_t[idx_prev] # Shape: [B*N, 2]
+                xt_idx = torch.multinomial(p_xt, num_samples=1).squeeze(-1)
+                x = self.process._idx_to_spin(xt_idx)
+
+        # 4. Final step: Ensure the boundary exactly matches the clean ground truth
+        x = torch.where(mask_expand, x, x0_fixed_expand)
+
+        print(f"Sampling finished in {time.perf_counter() - start_time:.4f}s")
+        return x.view(batch_size, N, 1)
+    
+    @torch.no_grad()
+    def sample_d3pm_repaint_optimized(self, batch_size: int, edge_index_single: torch.Tensor, field_single: torch.Tensor, mask_single: torch.Tensor, x0_fixed_single: torch.Tensor, jump_len: int = 10, jump_n_sample: int = 10, t_jump_threshold: int = 100):
+        # 1. Prepare standard batch
+        x, field_expand, edge_index, batch_vec, N = self._prepare_batch(batch_size, edge_index_single, field_single)
+        
+        # Expand single condition mask and fixed states across the batch dimension
+        mask_expand = mask_single.to(self.device).unsqueeze(1).repeat(batch_size, 1)
+        x0_fixed_expand = x0_fixed_single.to(self.device).repeat(batch_size, 1)
+        
+        # 2. Compute Optimized RePaint Schedule
+        schedule = []
+        t = self.process.timesteps - 1
+        jumps = {}
+        
+        # OPTIMIZATION: Only allocate jumps if t is strictly below the threshold
+        for j in range(0, t_jump_threshold - jump_len + 1, jump_len):
+            jumps[j] = jump_n_sample - 1
+            
+        while t >= 0:
+            schedule.append(("backward", t))
+            t -= 1
+            # Time Travel: Step forward 'jump_len' times if we hit a jump point
+            if t in jumps and jumps[t] > 0:
+                jumps[t] -= 1
+                for _ in range(jump_len):
+                    t += 1
+                    schedule.append(("forward", t))
+
+        start_time = time.perf_counter()
+        
+        # 3. Execute Schedule
+        for op, t_val in tqdm(schedule, desc="Optimized RePaint", leave=False):
+            t_tensor = torch.full((batch_size,), t_val, device=self.device, dtype=torch.long)
+            
+            if op == "backward":
+                # Enforce known boundary state at noise level t
+                x_known = self.process.q_sample(x0_fixed_expand, t_tensor, batch_vec)
+                x = torch.where(mask_expand, x, x_known)
+                
+                # Predict the next less-noisy state using the GNN
+                x = self.process.d3pm_step(
+                    model=self.model, x_t=x, t=t_tensor, 
+                    batch_vec=batch_vec, edge_index=edge_index, field=field_expand
+                )
+            
+            elif op == "forward":
+                # Forward Noise Step (t-1 -> t) using the 1-step discrete matrix Q_t
+                idx_prev = self.process._spin_to_idx(x)
+                q_t = self.process.Q_t[t_val] # Shape: [2, 2]
+                
+                # Get transition probabilities and sample
+                p_xt = q_t[idx_prev] # Shape: [B*N, 2]
+                xt_idx = torch.multinomial(p_xt, num_samples=1).squeeze(-1)
+                x = self.process._idx_to_spin(xt_idx)
+
+        # 4. Final step: Ensure the boundary exactly matches the clean ground truth
+        x = torch.where(mask_expand, x, x0_fixed_expand)
+
+        print(f"Sampling finished in {time.perf_counter() - start_time:.4f}s")
         return x.view(batch_size, N, 1)
