@@ -3,7 +3,7 @@ import json
 import torch
 from models.unetGnn import GNNUnet
 
-def load_model_from_checkpoint(checkpoint_dir, device, load_best=False):
+def load_model_from_checkpoint(checkpoint_dir, device, load_best=False, epoch=None):
     """
     Reconstructs the GNNUnet and loads weights based on the checkpoint metadata.
     """
@@ -28,7 +28,11 @@ def load_model_from_checkpoint(checkpoint_dir, device, load_best=False):
     )
     
     # 3. Choose which weights to load
-    weight_file = "model_best.pt" if load_best else "model_last.pt"
+    if epoch is not None:
+        weight_file = f"step_checkpoints/model_step_{epoch}.pt"
+        print(f"[*] Attempting to load model from epoch {epoch} checkpoint: {weight_file}")
+    else:
+        weight_file = "model_best.pt" if load_best else "model_last.pt"
     weight_path = os.path.join(checkpoint_dir, weight_file)
     print("CARICATO DIO")
     

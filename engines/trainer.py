@@ -34,6 +34,26 @@ class IsingTrainer:
         self.save_path = save_path
         self.best_val_loss = float('inf')
 
+    def _sample_grouped_t(self, batch):
+        """Draw one diffusion timestep per *instance* present in the batch and
+        broadcast it to every chain of that instance, instead of an
+        independent t per graph.
+
+        This mirrors generation, where all chains sampled for a given
+        (h, J) instance share the same t at every step -- so the
+        per-instance empirical-magnetization probe (mk_emp, see
+        compute_local_mag in unetGnn.py) has a single, deterministic
+        lambda_t scale, matching what the model is trained to calibrate
+        against. Sampling t independently per graph would mix chains of
+        the same instance at different noise levels into mk_emp, giving it
+        an uncontrolled, batch-dependent effective scale never seen at
+        generation time.
+        """
+        inst = batch.instance_idx.view(-1)
+        uniq, inv = torch.unique(inst, return_inverse=True)
+        t_group = torch.randint(0, self.process.timesteps - 1, (len(uniq),), device=self.device)
+        return t_group[inv]
+
     def correlation_loss(self, pred_x0: torch.Tensor, target_x0: torch.Tensor, edge_index: torch.Tensor):
         """Computes the physical energy correlation loss."""
         pred_src, pred_dst = pred_x0[edge_index[0]], pred_x0[edge_index[1]]
@@ -43,7 +63,8 @@ class IsingTrainer:
     def train_step(self, batch):
         self.model.train()
         B = batch.batch_size
-        time_idx = torch.randint(0, self.process.timesteps - 1, (B,), device=self.device)
+        # time_idx = torch.randint(0, self.process.timesteps - 1, (B,), device=self.device)
+        time_idx = self._sample_grouped_t(batch)
         # with self.accelerator.accumulate(self.model):    
         with self.accelerator.autocast():
             # 1. Ask the Process for the primary loss and the predicted clean state
@@ -67,7 +88,8 @@ class IsingTrainer:
     def val_step(self, batch):
         self.model.eval()
         B = batch.batch_size
-        time_idx = torch.randint(0, self.process.timesteps - 1, (B,), device=self.device)
+        # time_idx = torch.randint(0, self.process.timesteps - 1, (B,), device=self.device)
+        time_idx = self._sample_grouped_t(batch)
         
         base_loss, _ = self.process.compute_loss(self.model, batch, time_idx)
         return base_loss.detach().item()
@@ -97,16 +119,19 @@ class IsingTrainer:
 
             # 3. Validation and Epoch Logging
             # Adjust frequency as needed (e.g., every 10 or 100 epochs)
+            
             if epoch % 10 == 0:
                 val_loss_sum = 0.0
                 self.model.eval()
+                if self.val_loader is not None:
+                    with torch.no_grad():
+                        for batch in self.val_loader:
+                            val_loss_sum += self.val_step(batch)
                 
-                with torch.no_grad():
-                    for batch in self.val_loader:
-                        val_loss_sum += self.val_step(batch)
-                
+                    val_loss = val_loss_sum / len(self.val_loader)
+                else:
+                    val_loss = 0.0
                 train_loss = train_loss_sum / len(self.train_loader)
-                val_loss = val_loss_sum / len(self.val_loader)
                 
                 # 4. Use the tracker to handle model saving and CSV logging
                 # This replaces your old self._save_checkpoint(val_loss, epoch)

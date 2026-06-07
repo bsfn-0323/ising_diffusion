@@ -17,6 +17,7 @@ def parse_args():
     parser.add_argument("--num_samples", type=int, default=8192, help="Total samples to generate")
     parser.add_argument("--batch_size", type=int, default=2048, help="Max VRAM batch size per GPU")
     parser.add_argument("--load_best", action="store_true", help="Load model_best.pt instead of model_last.pt")
+    parser.add_argument("--load_epoch", type=int, default=None, help="Specify epoch to load model from step_checkpoints")
     parser.add_argument("--truedata_path", type=str, required=True)
     parser.add_argument("--out_path",type=str,default=None)
     parser.add_argument("--rep",type=int,default=None)
@@ -30,7 +31,7 @@ def main():
     print(f"[*] Running sampling on device: {device}")
 
     # 1. Load Model and Config
-    model, config = load_model_from_checkpoint(args.checkpoint_path, device, load_best=args.load_best)
+    model, config = load_model_from_checkpoint(args.checkpoint_path, device, load_best=args.load_best, epoch=args.load_epoch)
     diff_config = config["diffusion"]
     train_args = config.get("training_params", {})
     
@@ -77,7 +78,7 @@ def main():
     sampling_kwargs = {
         "edge_index_single": edge_index,
         # "edge_weight_single": edge_weight,
-        "field_single": torch.from_numpy(mk).float()
+        "field_single": torch.from_numpy(h).reshape(-1,1).float()
     }
 
     print(f"[*] Starting {method.upper()} Distributed Sampling...")
@@ -105,6 +106,9 @@ def main():
         m_gen = final_spins.sign().reshape(-1, N).cpu().mean(-1)
         m_true = data_raw.reshape(-1, N).mean(-1)
 
+        mk_gen = final_spins.sign().reshape(-1, N).cpu().mean(0)
+        mk_true = data_raw.reshape(-1, N).mean(0)
+
         plt.hist(m_gen, bins=21, range=(-1, 1), alpha=0.5, density=True, label="Generated")
         plt.hist(m_true, bins=21, range=(-1, 1), alpha=0.5, density=True, label="True Data")
         plt.title(f"Magnetization PDF: {method.upper()} vs True Data")
@@ -115,7 +119,24 @@ def main():
         
         plt.savefig(plot_path)
         plt.close()
+        plt.scatter(mk_true, mk_gen, alpha=0.5,s=5)
+        plt.plot([-1, 1], [-1, 1], 'r--')  # Reference line y=x
+        plt.xlabel("True Local Magnetization")
+        plt.ylabel("Generated Local Magnetization")
+        plt.title(f"Local Magnetization Correlation: {method.upper()}")
+        plt.savefig(plot_path.replace("magn_", "mk_scatter_"))
+        plt.close()
         
+        data_raw = data_raw.reshape(-1, N)
+        final_spins = final_spins.reshape(-1, N)
+        corr_data = data_raw.T @ data_raw / data_raw.shape[0]
+        corr_gen = final_spins.T @ final_spins / final_spins.shape[0]
+        plt.scatter(corr_data.flatten(), corr_gen.cpu().numpy().flatten(), alpha=0.5, s=5)
+        plt.xlabel("True Correlation")
+        plt.ylabel("Generated Correlation")
+        plt.title(f"Correlation Matrix Correlation: {method.upper()}")
+        plt.savefig(plot_path.replace("magn_", "corr_scatter_"))
+        plt.close()
         print(f"[*] Done. Samples: {samples_path} | Plot: {plot_path}")
 
 if __name__ == "__main__":

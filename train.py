@@ -6,15 +6,39 @@ from accelerate import Accelerator
 from torch.utils.data import random_split
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data, Dataset
-
+# from torch.utils.data import DataLoader
 from processes.sde import ContinuousVPSDE, get_cosine_schedule
 from processes.discrete import D3PMProcess
 from models.unetGnn import GNNUnet
 from engines.trainer import IsingTrainer
 from utils.tracker import ExperimentTracker
 
+# from torch_geometric.data import Batch
+# def collate_with_localmag(data_list):
+#     batch = Batch.from_data_list(data_list)        # standard PyG collate
+
+#     # instance id per graph -> need it on the batch
+#     # (assumes each Data has .inst, shape [1])
+#     inst = batch.instance_idx.view(-1)               # [B]
+#     device = batch.x.device
+#     N = int(batch.ptr[1] - batch.ptr[0])
+#     A = int(inst.max()) + 1
+
+#     x = batch.x.view(-1)
+#     node_inst = inst[batch.batch]                  # [B*N]
+#     site = torch.arange(batch.num_nodes, device=device) - batch.ptr[batch.batch]
+#     flat = node_inst * N + site                    # (instance, site) key
+
+#     numer = torch.zeros(A * N, device=device, dtype=x.dtype).scatter_add_(0, flat, x)
+#     cnt   = torch.zeros(A * N, device=device, dtype=x.dtype).scatter_add_(0, flat, torch.ones_like(x))
+#     local_mag = numer / cnt.clamp(min=1)
+#     batch.local_magn = local_mag.reshape(A, N)  # [A, N], per-instance local magnetization
+#     batch.mk_emp = local_mag[flat].view(-1, 1)     # [B*N, 1], aligned with batch.x
+#     return batch
+
+
 class MultiFieldIsingDataset(Dataset):
-    def __init__(self, x_list=None, magn_list=None, edge_index_list=None, augment=False, load_path=None):
+    def __init__(self, x_list=None, magn_list=None, field_list=None, edge_index_list=None, augment=False, load_path=None):
         super().__init__()
         self.augment = augment
         
@@ -22,6 +46,7 @@ class MultiFieldIsingDataset(Dataset):
             # Load the processed tensors from disk
             data_dict = torch.load(load_path)
             self.x_all = data_dict['x_all']
+            self.mks = data_dict['mks']
             self.fields = data_dict['fields']
             self.edge_indices = data_dict['edge_indices']
             self.sample_to_instance = data_dict['sample_to_instance']
@@ -29,8 +54,9 @@ class MultiFieldIsingDataset(Dataset):
         else:
             # Process the raw lists into tensors
             self.edge_indices = [torch.tensor(ei, dtype=torch.long) for ei in edge_index_list]
-            self.fields = [torch.tensor(m, dtype=torch.float32).view(-1, 1) for m in magn_list]
-            
+            self.mks = [torch.tensor(m, dtype=torch.float32).view(-1, 1) for m in magn_list]
+            self.fields = [torch.tensor(f, dtype=torch.float32).view(-1, 1) for f in field_list]
+
             all_x = []
             sample_to_instance = []
             
@@ -48,12 +74,13 @@ class MultiFieldIsingDataset(Dataset):
         """Saves the processed dataset to a single file."""
         torch.save({
             'x_all': self.x_all,
+            'mks': self.mks,
             'fields': self.fields,
             'edge_indices': self.edge_indices,
             'sample_to_instance': self.sample_to_instance
         }, path)
         print(f"[*] Dataset saved to {path}")
-
+    
     def len(self):
         return self.x_all.size(0)
 
@@ -65,14 +92,77 @@ class MultiFieldIsingDataset(Dataset):
         x = self.x_all[idx].view(-1, 1) 
         
         # 3. Retrieve the correct field [144, 1] and edge_index [2, E]
+        mk = self.mks[instance_idx]
         field = self.fields[instance_idx]
         edge_index = self.edge_indices[instance_idx]
         
         # Consistent Z2 symmetry augmentation
         if self.augment and torch.rand(1).item() < 0.5:
             x, field = -x, -field
+            mk = -mk
+        return Data(x=x,mk=mk, field=field, edge_index=edge_index,instance_idx=torch.tensor(instance_idx, dtype=torch.long))
+        
+# class MultiFieldIsingDataset(Dataset):
+#     def __init__(self, x_list=None, magn_list=None, edge_index_list=None, augment=False, load_path=None):
+#         super().__init__()
+#         self.augment = augment
+        
+#         if load_path and os.path.exists(load_path):
+#             # Load the processed tensors from disk
+#             data_dict = torch.load(load_path)
+#             self.x_all = data_dict['x_all']
+#             self.fields = data_dict['fields']
+#             self.edge_indices = data_dict['edge_indices']
+#             self.sample_to_instance = data_dict['sample_to_instance']
+#             print(f"[*] Dataset loaded from {load_path}")
+#         else:
+#             # Process the raw lists into tensors
+#             self.edge_indices = [torch.tensor(ei, dtype=torch.long) for ei in edge_index_list]
+#             self.fields = [torch.tensor(m, dtype=torch.float32).view(-1, 1) for m in magn_list]
             
-        return Data(x=x, field=field, edge_index=edge_index)
+#             all_x = []
+#             sample_to_instance = []
+            
+#             for i, x_samples in enumerate(x_list):
+#                 x_tensor = torch.tensor(x_samples, dtype=torch.float32) # [N_samples, 144, 1]
+#                 all_x.append(x_tensor)
+#                 # Map these samples to the i-th instance (field/topology)
+#                 sample_to_instance.extend([i] * x_tensor.size(0))
+            
+#             self.x_all = torch.cat(all_x, dim=0)
+#             self.sample_to_instance = torch.tensor(sample_to_instance, dtype=torch.long)
+#             print(f"[*] Dataset built: {self.x_all.size(0)} total samples.")
+
+#     def save(self, path):
+#         """Saves the processed dataset to a single file."""
+#         torch.save({
+#             'x_all': self.x_all,
+#             'fields': self.fields,
+#             'edge_indices': self.edge_indices,
+#             'sample_to_instance': self.sample_to_instance
+#         }, path)
+#         print(f"[*] Dataset saved to {path}")
+
+#     def len(self):
+#         return self.x_all.size(0)
+
+#     def get(self, idx):
+#         # 1. Identify which realization (instance) this sample belongs to
+#         instance_idx = self.sample_to_instance[idx].item()
+        
+#         # 2. Slice the configuration [144, 1]
+#         x = self.x_all[idx].view(-1, 1) 
+        
+#         # 3. Retrieve the correct field [144, 1] and edge_index [2, E]
+#         field = self.fields[instance_idx]
+#         edge_index = self.edge_indices[instance_idx]
+        
+#         # Consistent Z2 symmetry augmentation
+#         if self.augment and torch.rand(1).item() < 0.5:
+#             x, field = -x, -field
+            
+#         return Data(x=x, field=field, edge_index=edge_index)
+
 class MyDataset(Dataset):
     def __init__(self, x_all, field, edge_index, edge_weight, augment=False):
         super().__init__()
@@ -120,7 +210,7 @@ def main():
 
     betas_schedule = get_cosine_schedule(args.timesteps)
     if args.discrete:
-        process = D3PMProcess(betas=betas_schedule, device=device, lambda_aux=0.1)
+        process = D3PMProcess(betas=betas_schedule, device=device, lambda_aux=0.1,lambda_mk=0.5)
     else:
         process = ContinuousVPSDE(betas=betas_schedule, device=device)
 
@@ -151,13 +241,13 @@ def main():
     # ds = MyDataset(data, mk.reshape(N, 1), edge_index, edge_weight)
     # ds = torch.load("/mnt/beegfs/2a/sb12724/rfim_learn_fields/processed_dataset_L12.pt")
     ds = MultiFieldIsingDataset(load_path=args.data_path, augment=False)
-    train_size = int(0.8 * len(ds))
+    train_size = int(len(ds))
     val_size = len(ds) - train_size
     train_ds, val_ds = random_split(ds, [train_size, val_size])
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, persistent_workers=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size_val, shuffle=False)
-
+    # val_loader = DataLoader(val_ds, batch_size=args.batch_size_val, shuffle=False)
+    val_loader=None
     exp_args = vars(args)
     tracker = ExperimentTracker(
         base_path=args.save_path,

@@ -103,7 +103,7 @@ def main():
         
         plt.figure(figsize=(8, 5))
         m_gen = final_spins.sign().reshape(-1, N).cpu().mean(-1)
-        m_true = data_raw.reshape(-1, N).mean(-1)
+        m_true = data_raw[:min(args.num_samples, len(data_raw))].reshape(-1, N).mean(-1)
 
         plt.hist(m_gen, bins=21, range=(-1, 1), alpha=0.5, density=True, label="Generated")
         plt.hist(m_true, bins=21, range=(-1, 1), alpha=0.5, density=True, label="True Data")
