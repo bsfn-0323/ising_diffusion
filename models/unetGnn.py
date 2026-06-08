@@ -87,10 +87,6 @@ class GNNLayer(nn.Module):
         nn.init.zeros_(self.t_proj[1].weight)
         nn.init.zeros_(self.t_proj[1].bias)
 
-        self.g_proj = nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, in_ch * 2))
-        nn.init.zeros_(self.g_proj[1].weight)
-        nn.init.zeros_(self.g_proj[1].bias)
-        
         self.f_proj = nn.Linear(1, in_ch * 2, bias=False)
         # self.f_proj = nn.Sequential(
         #     nn.Linear(1, in_ch),
@@ -112,17 +108,16 @@ class GNNLayer(nn.Module):
             
         self.shortcut = nn.Linear(in_ch, out_ch, bias=False) if in_ch != out_ch else nn.Identity()
 
-    def forward(self, x, edge_index, batch, t_vec, field, field_emb=None):
+    def forward(self, x, edge_index, batch, t_vec, field):
         x_in = x
-        
+
         # MUST pass batch here now for dynamic pooling
         x = self.norm(x, batch)
-        
+
         style_t = self.t_proj(t_vec)
         style_h = self.f_proj(field)
-        
-        cond = style_t[batch] + style_h + self.g_proj(field_emb)[batch]
-        # cond = style_t[batch] + style_h 
+
+        cond = style_t[batch] + style_h
         gamma, beta = cond.chunk(2, dim=-1)
         
         x = x * (1.0 + gamma) + beta
@@ -152,45 +147,6 @@ class GNNUnet(nn.Module):
             nn.Linear(time_emb_dim * 2, time_emb_dim, bias=False),
         )
 
-        # Field-prediction branch: m_hat ~ true local magnetization <s_k>,
-        # regressed from (h, J/topology) AND an empirical probe mk_emp of the
-        # *current* diffused batch -- the per-instance average (over that
-        # instance's chains in the batch) of the noisy x_t, via
-        # compute_local_mag. For the symmetric binary channel,
-        # E[x_t | x_0] = lambda_t * x_0 (lambda_t = the second eigenvalue of
-        # Q_bar_t = prod(1-b_t')), so mk_emp ~= mk_i * lambda_t + noise(t):
-        # a *deterministically rescaled, unbiased* probe of the truth at every
-        # noise level -- not "the model's current guess" fed back on itself.
-        # We deliberately do NOT divide out lambda_t (that blows up the noise
-        # as t -> T, where lambda_t -> 0); instead we hand the network mk_emp
-        # together with the time embedding and let it learn the known,
-        # deterministic rescaling itself, in a naturally regularized way.
-        #
-        # Learning (h, J) -> <s_k> from scratch is, structurally, learning to
-        # solve the belief-propagation/cavity fixed point: an iterative,
-        # non-local computation (messages travel ~ the correlation length).
-        # mk_emp gives the regressor a running empirical anchor on the
-        # answer, turning "solve BP from nothing" into "calibrate a noisy
-        # probe" -- much like the ground-truth-mk conditioning that already
-        # works well, but computable without knowing the true mk in advance.
-        #
-        # The (h, J) -> <s_k> part is still hard and non-local, so -- as
-        # before -- we share ONE GraphConv and iterate it (residual + act),
-        # mirroring BP's fixed-point structure (a single local update rule
-        # applied repeatedly) rather than stacking K independent transforms
-        # tied to training-set depths/topologies.
-        self.field_iters = 4
-        self.field_in = nn.Linear(2, time_emb_dim, bias=False)
-        self.field_t_proj = nn.Linear(time_emb_dim, time_emb_dim, bias=False)
-        nn.init.zeros_(self.field_t_proj.weight)
-        self.field_convs = nn.ModuleList([
-            GraphConv(time_emb_dim, time_emb_dim, bias=False) for _ in range(self.field_iters)
-        ])
-        self.field_act = nn.SiLU()
-        self.field_out_act = nn.Tanh()
-        self.m_head = nn.Linear(time_emb_dim, 1, bias=False)
-        nn.init.zeros_(self.m_head.weight)
-
         self.in_conv = nn.Linear(2, base_ch, bias=False)
         
         self.encoder = nn.ModuleList([
@@ -216,51 +172,28 @@ class GNNUnet(nn.Module):
     def forward(self, x_in, batch, t):
         t_vec = self.time_emb(t)
 
-        hh = x_in[:,-1].unsqueeze(-1) #xin = (B(N), 2) -> (B(N), 1)
+        # Conditioning is just the raw local field h_i (x_in = [x_t, h_i],
+        # already (B(N), 2) -- matches in_conv's expected width directly).
+        # No learned field/global embedding: the denoiser's GraphConv message
+        # passing is the only thing that has to turn (h, J/topology) into
+        # something resembling <s_k> -- see compute_loss/loss_mk for how that
+        # is now supervised directly through the network's own x0 predictions.
+        hh = x_in[:, -1].unsqueeze(-1)
+        field = hh
 
-        # Empirical probe of the local magnetization from the *current* noisy
-        # batch: per-instance average of x_t over that instance's chains.
-        # Detached -- it's a function of the sampled x_t (already
-        # non-differentiable via multinomial), not something to backprop into.
-        mk_emp = compute_local_mag(x_in[:,0], batch.instance_idx, batch.batch, batch.ptr)[1].detach()
+        x = self.in_conv(x_in)
 
-        field_input = torch.cat((hh, mk_emp), dim=-1)  # (B(N), 2): [h_i, mk_emp_i]
-        gf = self.field_in(field_input) + self.field_t_proj(t_vec)[batch.batch]  # (B(N), time_emb_dim)
-        # Multi-hop message passing: field_iters independent GraphConv rounds
-        # (residual + activation), each extending the receptive field by one
-        # hop -- the version that empirically worked better than sharing one
-        # GraphConv across iterations.
-        for conv in self.field_convs:
-            gf = gf + self.field_act(conv(gf, batch.edge_index))
-            
-        m_hat = self.field_out_act(self.m_head(gf))
-
-        # Stop-gradient on m_hat only: its sole remaining consumer is loss_mk
-        # (mse against batch.mk), so m_head is trained purely as a supervised
-        # regressor for the true local magnetization -- the denoising loss can
-        # never reach it. gf is left attached so field_emb still gets a training
-        # signal from the denoising loss too, letting the shared representation
-        # learn richer features than "whatever compresses into one scalar".
-        field_emb = global_mean_pool(gf, batch.batch)   # [B, time_emb_dim]
-        field = m_hat.detach()
-        # field_emb =None
-
-        x_cat = torch.cat((x_in[:, 0].unsqueeze(-1), field), dim=-1)
-        x = self.in_conv(x_cat)
-
-        # x = self.in_conv(x_in)
-        
         x_residual = []
         for layer in self.encoder:
-            x = layer(x, batch.edge_index, batch.batch, t_vec, field, field_emb)
+            x = layer(x, batch.edge_index, batch.batch, t_vec, field)
             x_residual.append(x)
 
-        x = self.latent(x, batch.edge_index, batch.batch, t_vec, field, field_emb)
-        
+        x = self.latent(x, batch.edge_index, batch.batch, t_vec, field)
+
         for i, layer in enumerate(self.decoder):
             res = x_residual[-(i + 1)]
-            x = x + res 
-            x = layer(x.contiguous(), batch.edge_index, batch.batch, t_vec, field, field_emb)
+            x = x + res
+            x = layer(x.contiguous(), batch.edge_index, batch.batch, t_vec, field)
 
         # Final norm needs batch vector too
         x = self.final_norm(x, batch.batch)
@@ -268,4 +201,4 @@ class GNNUnet(nn.Module):
         x = torch.cat((x, field), dim=-1)
         x = self.out_conv(x)
 
-        return x, m_hat
+        return x

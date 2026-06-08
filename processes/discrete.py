@@ -1,6 +1,7 @@
 import torch
 import torch.nn.functional as F
 from .base import DiffusionProcess
+from models.unetGnn import compute_local_mag
 class D3PMProcess(DiffusionProcess):
     def __init__(self, betas: torch.Tensor, device: torch.device, lambda_aux: float = 0.01, lambda_mk: float = 0.1):
         self.device = device
@@ -39,13 +40,13 @@ class D3PMProcess(DiffusionProcess):
         q_bar_t_batch = self.Q_bar_t[t[batch.batch]] 
         p_xt = q_bar_t_batch[idx_arange, x0_idx] 
         xt_idx = torch.multinomial(p_xt, num_samples=1).squeeze()
-        xt_physical = self._idx_to_spin(xt_idx) 
-        
+        xt_physical = self._idx_to_spin(xt_idx)
+
         # 2. Model Prediction (BCE Setup)
         x_input = torch.cat([xt_physical, batch.field], dim=1)
         # Squeeze the (N, 1) output to (N,)
-        # logits,m_hat = model(x_input, batch.edge_index, batch.batch, t.float())
-        logits,m_hat = model(x_input, batch, t.float())
+        # logits = model(x_input, batch.edge_index, batch.batch, t.float())
+        logits = model(x_input, batch, t.float())
         logits = logits.float().squeeze(-1)
         
         # Reconstruct full probability distribution for KL Divergence
@@ -80,17 +81,27 @@ class D3PMProcess(DiffusionProcess):
         loss_vb_node = F.kl_div(torch.log(p_theta_xt_prev.clamp(min=1e-6)), q_posterior, reduction='none').sum(dim=-1)
         loss_vb = torch.where(t[batch.batch] == 0, torch.zeros_like(loss_vb_node), loss_vb_node).mean()
 
-        # Explicitly supervise the field-conditioning head: m_hat should predict the
-        # true (clean) local magnetization of the instance, not just whatever helps
-        # the denoising loss implicitly.
-        loss_mk = F.mse_loss(m_hat, batch.mk)
-
-        total_loss = loss_vb + self.lambda_aux * loss_aux + self.lambda_mk * loss_mk
-        
         # Logit > 0 corresponds to probability > 0.5
         x0_pred_idx = (logits > 0.0).long()
         p_plus = torch.sigmoid(logits)
         s_expected = (2.0 * p_plus - 1.0).unsqueeze(-1)
+
+        # Self-consistency loss: the network IS the BP/cavity solver -- there's
+        # no separate field-prediction head anymore. s_expected is the
+        # denoiser's own (differentiable) estimate of clean x0 at every t; if
+        # it's calibrated, E[s_expected | h, J] = <s_k> directly (no lambda_t
+        # rescaling needed, unlike a probe of the *noisy* x_t). Averaging it
+        # over every chain of an instance currently in the batch (via
+        # compute_local_mag, grouped by the true instance_idx -- pooling
+        # across all t too, since a calibrated x0 estimate shouldn't depend on
+        # t) and matching that average against the true batch.mk directly
+        # trains the denoiser toward the BP self-consistency fixed point --
+        # gradients flow through s_expected into the same logits loss_vb/
+        # loss_aux already shape, reinforcing rather than duplicating.
+        mk_pred_node = compute_local_mag(s_expected, batch.instance_idx, batch.batch, batch.ptr)[1]
+        loss_mk = F.mse_loss(mk_pred_node, batch.mk)
+
+        total_loss = loss_vb + self.lambda_aux * loss_aux + self.lambda_mk * loss_mk
 
         # return total_loss, self._idx_to_spin(x0_pred_idx)
         return total_loss, s_expected
@@ -102,8 +113,8 @@ class D3PMProcess(DiffusionProcess):
         idx_arange = torch.arange(N, device=self.device)
         
         x_input = torch.cat([x_t, batch.field], dim=1)
-        # logits,_ = model(x_input, edge_index, batch_vec, t.float())
-        logits,_ = model(x_input, batch, t.float())
+        # logits = model(x_input, edge_index, batch_vec, t.float())
+        logits = model(x_input, batch, t.float())
         logits = logits.float().squeeze(-1)
         
         p_plus = torch.sigmoid(logits)

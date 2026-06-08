@@ -16,7 +16,7 @@ class IsingTrainer:
         # hs: torch.Tensor,
         epochs: int,
         save_path: str,
-        tracker
+        tracker,
     ):
         self.model = model
         self.process = process
@@ -27,32 +27,12 @@ class IsingTrainer:
         self.accelerator = accelerator
         self.device = accelerator.device
         self.tracker=tracker
-        
+
         # self.Js = Js.to(self.device)
         # self.hs = hs.to(self.device)
         self.epochs = epochs
         self.save_path = save_path
         self.best_val_loss = float('inf')
-
-    def _sample_grouped_t(self, batch):
-        """Draw one diffusion timestep per *instance* present in the batch and
-        broadcast it to every chain of that instance, instead of an
-        independent t per graph.
-
-        This mirrors generation, where all chains sampled for a given
-        (h, J) instance share the same t at every step -- so the
-        per-instance empirical-magnetization probe (mk_emp, see
-        compute_local_mag in unetGnn.py) has a single, deterministic
-        lambda_t scale, matching what the model is trained to calibrate
-        against. Sampling t independently per graph would mix chains of
-        the same instance at different noise levels into mk_emp, giving it
-        an uncontrolled, batch-dependent effective scale never seen at
-        generation time.
-        """
-        inst = batch.instance_idx.view(-1)
-        uniq, inv = torch.unique(inst, return_inverse=True)
-        t_group = torch.randint(0, self.process.timesteps - 1, (len(uniq),), device=self.device)
-        return t_group[inv]
 
     def correlation_loss(self, pred_x0: torch.Tensor, target_x0: torch.Tensor, edge_index: torch.Tensor):
         """Computes the physical energy correlation loss."""
@@ -63,17 +43,16 @@ class IsingTrainer:
     def train_step(self, batch):
         self.model.train()
         B = batch.batch_size
-        # time_idx = torch.randint(0, self.process.timesteps - 1, (B,), device=self.device)
-        time_idx = self._sample_grouped_t(batch)
-        # with self.accelerator.accumulate(self.model):    
+        time_idx = torch.randint(0, self.process.timesteps - 1, (B,), device=self.device)
+        # with self.accelerator.accumulate(self.model):
         with self.accelerator.autocast():
             # 1. Ask the Process for the primary loss and the predicted clean state
             base_loss, x0_pred = self.process.compute_loss(self.model, batch, time_idx)
             
             # 2. Enforce Physical Constraints
-            loss_edge = self.correlation_loss(x0_pred.sign(), batch.x, batch.edge_index)
-            loss = base_loss + 0.5 * loss_edge
-            # loss = base_loss
+            # loss_edge = self.correlation_loss(x0_pred.sign(), batch.x, batch.edge_index)
+            # loss = base_loss + 0.5 * loss_edge
+            loss = base_loss
 
         self.accelerator.backward(loss)
         
@@ -88,9 +67,8 @@ class IsingTrainer:
     def val_step(self, batch):
         self.model.eval()
         B = batch.batch_size
-        # time_idx = torch.randint(0, self.process.timesteps - 1, (B,), device=self.device)
-        time_idx = self._sample_grouped_t(batch)
-        
+        time_idx = torch.randint(0, self.process.timesteps - 1, (B,), device=self.device)
+
         base_loss, _ = self.process.compute_loss(self.model, batch, time_idx)
         return base_loss.detach().item()
 

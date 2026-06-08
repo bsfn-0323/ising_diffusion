@@ -192,6 +192,7 @@ def parse_args():
     parser.add_argument("--ch_mult", type=int, nargs='+', default=[1, 2, 4])
     parser.add_argument("--time_emb_dim", type=int, default=32)
     parser.add_argument("--data_path", type=str, required=True)
+    parser.add_argument("--validation_path", type=str, default=None)
     parser.add_argument("--L", type=int, default=12)
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--batch_size_val", type=int, default=512)
@@ -210,7 +211,7 @@ def main():
 
     betas_schedule = get_cosine_schedule(args.timesteps)
     if args.discrete:
-        process = D3PMProcess(betas=betas_schedule, device=device, lambda_aux=0.1,lambda_mk=0.5)
+        process = D3PMProcess(betas=betas_schedule, device=device, lambda_aux=0.1, lambda_mk=0.1)
     else:
         process = ContinuousVPSDE(betas=betas_schedule, device=device)
 
@@ -240,14 +241,12 @@ def main():
 
     # ds = MyDataset(data, mk.reshape(N, 1), edge_index, edge_weight)
     # ds = torch.load("/mnt/beegfs/2a/sb12724/rfim_learn_fields/processed_dataset_L12.pt")
-    ds = MultiFieldIsingDataset(load_path=args.data_path, augment=False)
-    train_size = int(len(ds))
-    val_size = len(ds) - train_size
-    train_ds, val_ds = random_split(ds, [train_size, val_size])
+    train_ds = MultiFieldIsingDataset(load_path=args.data_path, augment=False)
+    val_ds = MultiFieldIsingDataset(load_path=args.validation_path, augment=False) if args.validation_path else None
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, persistent_workers=True)
-    # val_loader = DataLoader(val_ds, batch_size=args.batch_size_val, shuffle=False)
-    val_loader=None
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size_val, shuffle=False)
+    # val_loader=None
     exp_args = vars(args)
     tracker = ExperimentTracker(
         base_path=args.save_path,
@@ -258,7 +257,7 @@ def main():
         args=exp_args
     )
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(train_loader) * args.epochs, eta_min=args.lr/100)
 
     model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
@@ -275,7 +274,7 @@ def main():
         accelerator=accelerator,
         tracker=tracker,
         epochs=args.epochs,
-        save_path=tracker.get_save_path()
+        save_path=tracker.get_save_path(),
     )
 
     trainer.train()
