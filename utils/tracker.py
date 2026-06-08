@@ -51,7 +51,7 @@ class ExperimentTracker:
                 "base_ch": getattr(unwrapped, 'base_ch', None),
                 "time_emb_dim": getattr(unwrapped, 'time_emb_dim', None),
                 "discrete_mode": getattr(unwrapped, 'discrete', False),
-                "ch_mult": getattr(unwrapped, 'ch_mult', None)
+                "num_iters": getattr(unwrapped, 'num_iters', None)
             },
             "diffusion": diffusion_info,
             "training_params": {k: v for k, v in args.items() if k != 'betas'}

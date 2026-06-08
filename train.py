@@ -189,7 +189,8 @@ def parse_args():
     parser.add_argument("--M", type=int, default=20)
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--base_ch", type=int, default=32)
-    parser.add_argument("--ch_mult", type=int, nargs='+', default=[1, 2, 4])
+    parser.add_argument("--num_iters", type=int, default=10,
+                        help="Number of weight-shared message-passing iterations (BP-like fixed-point depth)")
     parser.add_argument("--time_emb_dim", type=int, default=32)
     parser.add_argument("--data_path", type=str, required=True)
     parser.add_argument("--validation_path", type=str, default=None)
@@ -217,9 +218,9 @@ def main():
 
     model = GNNUnet(
         base_ch=args.base_ch,
-        ch_mult=args.ch_mult,
         time_emb_dim=args.time_emb_dim,
-        discrete=args.discrete
+        discrete=args.discrete,
+        num_iters=args.num_iters,
     )
 
     data_dir = os.path.dirname(args.data_path)

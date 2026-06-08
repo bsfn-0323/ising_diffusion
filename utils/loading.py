@@ -22,9 +22,9 @@ def load_model_from_checkpoint(checkpoint_dir, device, load_best=False, epoch=No
     print(arch)
     model = GNNUnet(
         base_ch=arch["base_ch"],
-        ch_mult=arch["ch_mult"], # This was hardcoded in main, but you could save it too
         time_emb_dim=arch["time_emb_dim"],
-        discrete=arch.get("discrete_mode", True) 
+        discrete=arch.get("discrete_mode", True),
+        num_iters=arch.get("num_iters", 10),
     )
     
     # 3. Choose which weights to load

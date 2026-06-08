@@ -133,13 +133,20 @@ class GNNLayer(nn.Module):
         return x + self.shortcut(x_in)
 
 class GNNUnet(nn.Module):
-    # Removed `size` parameter from initialization
-    def __init__(self, base_ch: int, ch_mult: list, time_emb_dim: int,discrete:bool=False):
+    # Weight-shared iterated message passing: the same GNNLayer is applied
+    # `num_iters` times, mirroring belief propagation / the cavity method --
+    # a single local update rule run to a fixed point, rather than a
+    # feature-pyramid stack of distinct per-depth layers. This forces a fixed
+    # message width across iterations (just like real BP messages are
+    # constant-size sufficient statistics regardless of subtree size), and is
+    # the inductive bias that should let the network generalize the implicit
+    # "solve (h, J, topology) -> <s_k>" computation across new disorder
+    # instances from few training examples.
+    def __init__(self, base_ch: int, time_emb_dim: int, discrete: bool = False, num_iters: int = 10):
         super().__init__()
-        self.layer_len = len(ch_mult)
         self.time_emb_dim = time_emb_dim
-        self.base_ch =base_ch
-        self.ch_mult=ch_mult
+        self.base_ch = base_ch
+        self.num_iters = num_iters
         self.time_emb = nn.Sequential(
             SinusoidalPositionEmbeddings(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim * 2, bias=False),
@@ -148,25 +155,12 @@ class GNNUnet(nn.Module):
         )
 
         self.in_conv = nn.Linear(2, base_ch, bias=False)
-        
-        self.encoder = nn.ModuleList([
-            GNNLayer(base_ch * ch_mult[i], base_ch * ch_mult[i+1], time_emb_dim, encoder=True) 
-            for i in range(self.layer_len - 1)
-        ])
 
-        self.latent = GNNLayer(base_ch * ch_mult[-1], base_ch * ch_mult[-1], time_emb_dim, encoder=False)
-
-        self.decoder = nn.ModuleList([
-            GNNLayer(base_ch * ch_mult[i], base_ch * ch_mult[i-1], time_emb_dim, encoder=False)
-            for i in reversed(range(1, self.layer_len))
-        ])
+        self.block = GNNLayer(base_ch, base_ch, time_emb_dim, encoder=False)
 
         self.final_norm = RMSGraphNorm(base_ch, affine=False)
-        if not discrete:
-            self.out_conv = nn.Linear(base_ch + 1, 1, bias=True)
-        else:
-            self.out_conv = nn.Linear(base_ch + 1, 1, bias=True)
-            
+        self.out_conv = nn.Linear(base_ch + 1, 1, bias=True)
+
         self.act = nn.SiLU()
 
     def forward(self, x_in, batch, t):
@@ -183,17 +177,8 @@ class GNNUnet(nn.Module):
 
         x = self.in_conv(x_in)
 
-        x_residual = []
-        for layer in self.encoder:
-            x = layer(x, batch.edge_index, batch.batch, t_vec, field)
-            x_residual.append(x)
-
-        x = self.latent(x, batch.edge_index, batch.batch, t_vec, field)
-
-        for i, layer in enumerate(self.decoder):
-            res = x_residual[-(i + 1)]
-            x = x + res
-            x = layer(x.contiguous(), batch.edge_index, batch.batch, t_vec, field)
+        for _ in range(self.num_iters):
+            x = self.block(x, batch.edge_index, batch.batch, t_vec, field)
 
         # Final norm needs batch vector too
         x = self.final_norm(x, batch.batch)
