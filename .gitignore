@@ -8,3 +8,4 @@ checkpoints/
 *.pyc
 
 oldprof_results/
+prof_results/
