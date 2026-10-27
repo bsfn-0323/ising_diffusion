@@ -1,29 +1,10 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn.conv import GraphConv,GCNConv,ChebConv
-# from torch_geometric.nn.norm import BatchNorm,GraphNorm,LayerNorm
-# from torch.nn import GroupNorm
+from torch_geometric.nn.conv import GraphConv
 from torch_geometric.nn.pool import global_mean_pool
 import math
 
-def compute_local_mag(x,instance_idx,batch,ptr):
-    device = x.device
-    N = int(ptr[1] - ptr[0])
-    A = int(instance_idx.max()) + 1
-    x = x.view(-1)                              # [B*N]
-
-    # per-node instance id and site id
-    node_inst = instance_idx[batch]       # [B*N]
-    site = (torch.arange(x.shape[0], device=device) - ptr[batch])  # [B*N], 0..N-1
-    flat = node_inst * N + site                       # unique (instance,site) key
-
-    numer = torch.zeros(A * N, device=device, dtype=x.dtype).scatter_add_(0, flat, x)
-    cnt   = torch.zeros(A * N, device=device, dtype=x.dtype).scatter_add_(0, flat, torch.ones_like(x))
-    local_mag = (numer / cnt.clamp(min=1)).view(A, N)         # [A, N]
-
-    local_mag_node = local_mag.view(-1)[flat].view(-1, 1)     # [B*N, 1]
-    return local_mag, local_mag_node
 
 class SinusoidalPositionEmbeddings(nn.Module):
     def __init__(self, dim: int):
@@ -44,146 +25,140 @@ class RMSGraphNorm(nn.Module):
         super().__init__()
         self.eps = eps
         self.affine = affine
-
         if affine:
             self.weight = nn.Parameter(torch.ones(channels))
-            self.bias = nn.Parameter(torch.zeros(channels))
+            self.bias   = nn.Parameter(torch.zeros(channels))
         else:
             self.register_parameter('weight', None)
-            self.register_parameter('bias', None)
+            self.bias = None
 
-    def forward(self, x: torch.Tensor, batch: torch.Tensor):
-        # 1. Square the node features
+    def forward(self, x: torch.Tensor, batch: torch.Tensor, num_graphs: int = None):
         x_sq = x.pow(2)
-        
-        # 2. Compute mean squared per graph dynamically using the batch vector
-        # Returns shape: [Batch_size, Channels]
-        mean_sq = global_mean_pool(x_sq, batch)
-        
-        # 3. Broadcast the graph-level mean back to all individual nodes
-        # Returns shape: [Total_nodes_in_batch, Channels]
-        mean_sq_expanded = mean_sq[batch]
-        
-        # 4. RMS Calculation
-        inv_rms = torch.rsqrt(mean_sq_expanded + self.eps)
+        # Pass num_graphs so global_mean_pool skips the int(index.max())+1 .item()
+        # call — that call is a Python-side scalar and breaks torch.compile / dynamo
+        # tracing. Providing the size statically removes the graph break.
+        mean_sq = global_mean_pool(x_sq, batch, size=num_graphs)
+        inv_rms = torch.rsqrt(mean_sq[batch] + self.eps)
         y = x * inv_rms
-
         if self.affine and self.weight is not None:
             y = y * self.weight
             if self.bias is not None:
                 y = y + self.bias
-
         return y
-    
+
+
 class GNNLayer(nn.Module):
-    def __init__(self, in_ch: int, out_ch: int, time_emb_dim: int, encoder: bool = False):
+    def __init__(self, in_ch: int, out_ch: int, time_emb_dim: int,
+                 encoder: bool = False, damping: float = 0.95):
         super().__init__()
         self.encoder = encoder
-        
-        # Size is gone!
-        self.norm = RMSGraphNorm(channels=in_ch, affine=False)
-        
+        # self.damping = damping
+        self.damping_logit = nn.Parameter(torch.logit(torch.tensor(float(damping))))
+
+        self.norm   = RMSGraphNorm(channels=in_ch, affine=False)
         self.t_proj = nn.Sequential(nn.SiLU(), nn.Linear(time_emb_dim, in_ch * 2))
         nn.init.zeros_(self.t_proj[1].weight)
         nn.init.zeros_(self.t_proj[1].bias)
-
         self.f_proj = nn.Linear(1, in_ch * 2, bias=False)
-        # self.f_proj = nn.Sequential(
-        #     nn.Linear(1, in_ch),
-        #     nn.SiLU(),
-        #     nn.Linear(in_ch, in_ch * 2)
-        # )
-        nn.init.zeros_(self.f_proj.weight)
-        # nn.init.zeros_(self.f_proj[2].weight)
-        # nn.init.zeros_(self.f_proj[2].bias)
-        
-        self.conv0 = GraphConv(in_ch, in_ch, bias=False)
-        self.act = nn.SiLU()
-        self.conv1 = GraphConv(in_ch, out_ch, bias=False)
-        
+        # Single GraphConv per iteration (was conv0 -> act -> conv1).
+        # Combined with doubling num_iters, the per-forward-pass receptive
+        # field (in hops) is unchanged, while halving the number of
+        # multiplicative Lipschitz factors per iteration.
+        self.conv   = GraphConv(in_ch, out_ch, bias=False)
+        self.act    = nn.SiLU()
+        self.dmin = 0.1  # Minimum damping factor to ensure some contribution from the GNN update
         if not encoder:
-            self.mlp = nn.Sequential(nn.Linear(in_ch, 2 * in_ch), nn.SiLU(), nn.Linear(2 * in_ch, in_ch))
+            self.mlp = nn.Sequential(
+                nn.Linear(in_ch, 2 * in_ch), nn.SiLU(), nn.Linear(2 * in_ch, in_ch)
+            )
             nn.init.zeros_(self.mlp[2].weight)
             nn.init.zeros_(self.mlp[2].bias)
-            
+
         self.shortcut = nn.Linear(in_ch, out_ch, bias=False) if in_ch != out_ch else nn.Identity()
 
-    def forward(self, x, edge_index, batch, t_vec, field):
+    # ------------------------------------------------------------------ #
+    # OPT-1: conditioning is constant across all num_iters iterations
+    #   (t_vec and field don't change between iterations).
+    #   Compute gamma/beta once in GNNUnet and pass them in, eliminating
+    #   redundant t_proj + f_proj calls per forward pass.
+    # ------------------------------------------------------------------ #
+    def precompute_cond(self, t_vec, field, batch_vec):
+        style_t = self.t_proj(t_vec)       # [B, in_ch*2]
+        style_h = self.f_proj(field)       # [N_total, in_ch*2]
+        cond = style_t[batch_vec] + style_h
+        return cond.chunk(2, dim=-1)       # (gamma, beta)
+
+    def forward(self, x, edge_index, batch, gamma, beta, num_graphs: int = None):
         x_in = x
-
-        # MUST pass batch here now for dynamic pooling
-        x = self.norm(x, batch)
-
-        style_t = self.t_proj(t_vec)
-        style_h = self.f_proj(field)
-
-        cond = style_t[batch] + style_h
-        gamma, beta = cond.chunk(2, dim=-1)
-        
+        x = self.norm(x, batch, num_graphs)
         x = x * (1.0 + gamma) + beta
         x = self.act(x)
-        
         if not self.encoder:
             x = x + self.mlp(x)
+        x = self.conv(x, edge_index)
+        damping = torch.sigmoid(self.damping_logit) *(1-self.dmin) + self.dmin
+        x = damping * x + (1 - damping) * self.shortcut(x_in)
+        return x
 
-        x = self.conv0(x, edge_index)
-        x = self.act(x)
-        x = self.conv1(x, edge_index)
-        
-        return x + self.shortcut(x_in)
 
 class GNNUnet(nn.Module):
-    # Weight-shared iterated message passing: the same GNNLayer is applied
-    # `num_iters` times, mirroring belief propagation / the cavity method --
-    # a single local update rule run to a fixed point, rather than a
-    # feature-pyramid stack of distinct per-depth layers. This forces a fixed
-    # message width across iterations (just like real BP messages are
-    # constant-size sufficient statistics regardless of subtree size), and is
-    # the inductive bias that should let the network generalize the implicit
-    # "solve (h, J, topology) -> <s_k>" computation across new disorder
-    # instances from few training examples.
-    def __init__(self, base_ch: int, time_emb_dim: int, discrete: bool = False, num_iters: int = 10):
+    def __init__(self, base_ch: int, time_emb_dim: int,
+                 discrete: bool = False, num_iters: int = 10, damping: float = 0.3):
         super().__init__()
         self.time_emb_dim = time_emb_dim
-        self.base_ch = base_ch
-        self.num_iters = num_iters
+        self.base_ch      = base_ch
+        self.num_iters    = num_iters
+
         self.time_emb = nn.Sequential(
             SinusoidalPositionEmbeddings(time_emb_dim),
             nn.Linear(time_emb_dim, time_emb_dim * 2, bias=False),
             nn.SiLU(),
             nn.Linear(time_emb_dim * 2, time_emb_dim, bias=False),
         )
+        self.field_stats_proj = nn.Sequential(
+            nn.Linear(4, time_emb_dim * 2),
+            nn.SiLU(),
+            nn.Linear(time_emb_dim * 2, time_emb_dim),
+        )
 
-        self.in_conv = nn.Linear(2, base_ch, bias=False)
-
-        self.block = GNNLayer(base_ch, base_ch, time_emb_dim, encoder=False)
-
+        self.in_conv    = nn.Linear(2, base_ch, bias=False)
+        self.block      = GNNLayer(base_ch, base_ch, time_emb_dim, encoder=False, damping=damping)
         self.final_norm = RMSGraphNorm(base_ch, affine=False)
-        self.out_conv = nn.Linear(base_ch + 1, 1, bias=True)
-
-        self.act = nn.SiLU()
+        # +6: h_i (local field) + mean(h_i) (graph-level signed mean, direct phase signal)
+        #      + mean(h_i^2) + mean(h_i * h_j) + std(h_i)
+        self.out_conv   = nn.Linear(base_ch + 5, 1, bias=True)
+        self.act        = nn.SiLU()
 
     def forward(self, x_in, batch, t):
         t_vec = self.time_emb(t)
+        field = x_in[:, -1].unsqueeze(-1)
 
-        # Conditioning is just the raw local field h_i (x_in = [x_t, h_i],
-        # already (B(N), 2) -- matches in_conv's expected width directly).
-        # No learned field/global embedding: the denoiser's GraphConv message
-        # passing is the only thing that has to turn (h, J/topology) into
-        # something resembling <s_k> -- see compute_loss/loss_mk for how that
-        # is now supervised directly through the network's own x0 predictions.
-        hh = x_in[:, -1].unsqueeze(-1)
-        field = hh
+        batch_vec  = batch.batch
+        num_graphs = batch.num_graphs
+
+        # Global disorder statistics — all computable from the quenched disorder
+        # at inference time, no leakage from the spin configuration.
+        h_signed_mean = global_mean_pool(field,            batch_vec, size=num_graphs)  # [B,1] SIGNED
+        h_sq_mean     = global_mean_pool(field.pow(2),     batch_vec, size=num_graphs)  # [B,1]
+        h_std         = (h_sq_mean - h_signed_mean.pow(2)).clamp(min=0).sqrt()          # [B,1]
+
+        # Edge frustration: mean(h_i * h_j) over all edges.
+        src, dst    = batch.edge_index
+        edge_prod   = field[src] * field[dst]                                           # [E,1]
+        h_edge_corr = global_mean_pool(edge_prod, batch_vec[src], size=num_graphs)      # [B,1]
+
+        h_stats = torch.cat([h_signed_mean, h_sq_mean, h_edge_corr, h_std], dim=-1)    # [B,4]
+        t_vec   = t_vec + self.field_stats_proj(h_stats)
 
         x = self.in_conv(x_in)
 
+        # OPT-1: precompute conditioning once for all num_iters iterations
+        gamma, beta = self.block.precompute_cond(t_vec, field, batch_vec)
+
         for _ in range(self.num_iters):
-            x = self.block(x, batch.edge_index, batch.batch, t_vec, field)
+            x = self.block(x, batch.edge_index, batch_vec, gamma, beta, num_graphs)
 
-        # Final norm needs batch vector too
-        x = self.final_norm(x, batch.batch)
+        x = self.final_norm(x, batch_vec, num_graphs)
         x = self.act(x)
-        x = torch.cat((x, field), dim=-1)
-        x = self.out_conv(x)
-
-        return x
+        x = torch.cat((x, field, h_signed_mean[batch_vec], h_sq_mean[batch_vec], h_edge_corr[batch_vec], h_std[batch_vec]), dim=-1)
+        return self.out_conv(x)

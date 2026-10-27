@@ -1,9 +1,9 @@
 import os
 import json
 import torch
-from models.unetGnn import GNNUnet
+from models.unetGnn_cfg import GNNUnet
 
-def load_model_from_checkpoint(checkpoint_dir, device, load_best=False, epoch=None):
+def load_model_from_checkpoint(checkpoint_dir, device, load_best=False, epoch=None,num_iters=None):
     """
     Reconstructs the GNNUnet and loads weights based on the checkpoint metadata.
     """
@@ -20,12 +20,20 @@ def load_model_from_checkpoint(checkpoint_dir, device, load_best=False, epoch=No
     # 2. Reconstruct Architecture
     # Ensure these keys match what the ExperimentTracker saved
     print(arch)
+    print(f"[*] Reconstructing GNNUnet with base_ch={arch['base_ch']}, time_emb_dim={arch['time_emb_dim']}, discrete_mode={arch.get('discrete_mode', True)}, num_iters={arch.get('num_iters', 10)}")
+    if num_iters is None:
+        num_iters = arch.get('num_iters', 10)
+    # print(f"arch = {arch['both']}")
     model = GNNUnet(
         base_ch=arch["base_ch"],
         time_emb_dim=arch["time_emb_dim"],
         discrete=arch.get("discrete_mode", True),
-        num_iters=arch.get("num_iters", 10),
+        num_iters=num_iters,
+        use_tilt_head=True,
+        both=False
     )
+    print(f"[*] Model parameters: {sum(p.numel() for p in model.parameters())}")
+    print(f"[*] Num_iters set to: {num_iters}")
     
     # 3. Choose which weights to load
     if epoch is not None:
@@ -45,7 +53,7 @@ def load_model_from_checkpoint(checkpoint_dir, device, load_best=False, epoch=No
     # If the model was saved via Accelerator/DDP, keys start with 'module.'
     new_state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
     
-    model.load_state_dict(new_state_dict)
+    model.load_state_dict(new_state_dict,strict=False)
     model.to(device)
     model.eval()
     

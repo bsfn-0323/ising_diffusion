@@ -75,12 +75,12 @@ class ExperimentTracker:
             unwrapped = self.accelerator.unwrap_model(model)
             torch.save(unwrapped.state_dict(), os.path.join(self.step_ckpt_path, f"model_step_{step}.pt"))
 
-    def log_epoch(self, epoch, train_loss, val_loss, model, optimizer):
+    def log_epoch(self, epoch, train_loss, val_loss,val_en,val_mk, model, optimizer):
         if not self.accelerator.is_main_process: return
 
         current_lr = optimizer.param_groups[0]['lr']
         with open(self.metrics_path, "a") as f:
-            f.write(f"{epoch},{train_loss:.8f},{val_loss:.8f},{current_lr:.8e}\n")
+            f.write(f"{epoch},{train_loss:.8f},{val_loss:.8f},{val_en:.8f},{val_mk:.8f},{current_lr:.8e}\n")
 
         unwrapped = self.accelerator.unwrap_model(model)
         torch.save(unwrapped.state_dict(), os.path.join(self.save_path, "model_last.pt"))

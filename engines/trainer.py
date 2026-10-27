@@ -17,6 +17,9 @@ class IsingTrainer:
         epochs: int,
         save_path: str,
         tracker,
+        use_mk: bool = False,  # New parameter to control the use of mk
+        use_both: bool= False,
+        fa_probe: bool = False,  # diagnostic-only: log flip-asymmetry r_hat vs tau, do not train on it
     ):
         self.model = model
         self.process = process
@@ -27,7 +30,9 @@ class IsingTrainer:
         self.accelerator = accelerator
         self.device = accelerator.device
         self.tracker=tracker
-
+        self.use_mk = use_mk  # Store the new parameter
+        self.use_both = use_both
+        self.fa_probe = fa_probe
         # self.Js = Js.to(self.device)
         # self.hs = hs.to(self.device)
         self.epochs = epochs
@@ -47,12 +52,28 @@ class IsingTrainer:
         # with self.accelerator.accumulate(self.model):
         with self.accelerator.autocast():
             # 1. Ask the Process for the primary loss and the predicted clean state
-            base_loss, x0_pred = self.process.compute_loss(self.model, batch, time_idx)
+            base_loss, _ = self.process.compute_loss(self.model, batch, time_idx,include_L0=False, use_mk=self.use_mk,use_both=self.use_both)
+            # base_loss, _ = self.process.compute_loss(self.model, batch, time_idx,include_L0=True)
             
             # 2. Enforce Physical Constraints
             # loss_edge = self.correlation_loss(x0_pred.sign(), batch.x, batch.edge_index)
             # loss = base_loss + 0.5 * loss_edge
             loss = base_loss
+
+            # 3. Flip-asymmetry ("free-energy") loss L_A -- fixes Z2 mode weights.
+            # if self.fa_probe:
+            #     # Diagnostic-first: compute L_A + r_hat vs tau and log, but DO NOT train on L_A.
+            #     # no_grad is essential: the extra forward passes must not build an
+            #     # autograd graph, else DDP sees params used in forward but never
+            #     # reduced (only base_loss is backpropagated) and errors next step.
+            #     with torch.no_grad():
+            #         fa_val, fa_diag = self.process.flip_asymmetry_loss(
+            #             self.model, batch, use_mk=self.use_mk, return_diag=True)
+            #     fa_diag["fa_LA"] = fa_val.item()
+            #     self._last_fa_diag = fa_diag
+            # elif getattr(self.process, "lambda_fa", 0.0) > 0.0:   # OFF when lambda_fa == 0
+            #     fa = self.process.flip_asymmetry_loss(self.model, batch, use_mk=self.use_mk)
+            #     loss = loss + self.process.lambda_fa * fa
 
         self.accelerator.backward(loss)
         
@@ -69,8 +90,13 @@ class IsingTrainer:
         B = batch.batch_size
         time_idx = torch.randint(0, self.process.timesteps - 1, (B,), device=self.device)
 
-        base_loss, _ = self.process.compute_loss(self.model, batch, time_idx)
-        return base_loss.detach().item()
+        base_loss, p_plus = self.process.compute_loss(self.model, batch, time_idx,include_L0=False, use_mk=self.use_mk,use_both=self.use_both)
+        x0_pred = (p_plus * 2 - 1).float().unsqueeze(-1)
+        val_energy = self.correlation_loss(x0_pred, batch.x, batch.edge_index).item()
+
+        val_mk = F.mse_loss(p_plus[:,None], batch.mk.float()).item()
+
+        return base_loss.detach().item(), val_energy, val_mk
 
     def train(self):
         epoch_iter = range(self.epochs)
@@ -92,7 +118,16 @@ class IsingTrainer:
                 # 2. Log intermediate step checkpoints (e.g., every 5000 steps)
                 # You can change mode to "log" for logarithmic saving
                 self.tracker.log_step(global_step, self.model, mode="linear", interval=50)
-            
+
+                # Diagnostic-first probe: report flip-asymmetry r_hat vs tau scale/corr.
+                if self.fa_probe and self.accelerator.is_main_process and global_step % 50 == 0:
+                    d = getattr(self, "_last_fa_diag", None)
+                    if d is not None:
+                        print(f"[FA probe] step {global_step}  L_A={d['fa_LA']:.3e}  "
+                              f"mean_rhat={d['fa_mean_rhat']:+.4f}  mean_tau={d['fa_mean_tau']:+.4f}  "
+                              f"corr={d['fa_corr']:+.3f}  mean|Kflip-Kreal|={d['fa_mean_absKdiff']:.2e}",
+                              flush=True)
+
                 self.scheduler.step()
 
             # 3. Validation and Epoch Logging
@@ -100,25 +135,35 @@ class IsingTrainer:
             
             if epoch % 10 == 0:
                 val_loss_sum = 0.0
+                val_energy_sum = 0.0
+                val_mk_sum = 0.0
                 self.model.eval()
                 if self.val_loader is not None:
                     with torch.no_grad():
                         for batch in self.val_loader:
-                            val_loss_sum += self.val_step(batch)
-                
+                            single_val_loss,val_energy, val_mk = self.val_step(batch)
+                            val_loss_sum += single_val_loss
+                            val_energy_sum += val_energy
+                            val_mk_sum += val_mk
+
                     val_loss = val_loss_sum / len(self.val_loader)
+                    val_energy = val_energy_sum / len(self.val_loader)
+                    val_mk = val_mk_sum / len(self.val_loader)
                 else:
                     val_loss = 0.0
+                    val_energy = 0.0
+                    val_mk = 0.0
                 train_loss = train_loss_sum / len(self.train_loader)
-                
+
                 # 4. Use the tracker to handle model saving and CSV logging
                 # This replaces your old self._save_checkpoint(val_loss, epoch)
-                self.tracker.log_epoch(epoch, train_loss, val_loss, self.model, self.optimizer)
+                self.tracker.log_epoch(epoch, train_loss, val_loss,val_energy,val_mk, self.model, self.optimizer)
                 
                 if self.accelerator.is_main_process:
                     # Update TQDM postfix with current loss info
-                    epoch_iter.set_postfix({"train": f"{train_loss:.4f}", "val": f"{val_loss:.4f}"})
-
+                    epoch_iter.set_postfix({"train": f"{train_loss:.4f}", "val": f"{val_loss:.4f}", "energy": f"{val_energy:.4f}", "mk": f"{val_mk:.4f}"})
+                    # m = self.accelerator.unwrap_model(self.model)
+                    # epoch_iter.set_postfix({"damping": f"{(m.block.dmin+(1-m.block.dmin)*m.block.damping_logit.sigmoid()).item():.4f}"})
         # 5. Finalize: Generate the loss curves once training is complete
         self.tracker.finalize()
         self.accelerator.wait_for_everyone()

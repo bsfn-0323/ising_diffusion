@@ -188,7 +188,7 @@ def parse_args():
     parser.add_argument("--Tmax", type=float, default=2.5)
     parser.add_argument("--M", type=int, default=20)
     parser.add_argument("--timesteps", type=int, default=1000)
-    parser.add_argument("--base_ch", type=int, default=32)
+    parser.add_argument("--base_ch", type=int, default=64)
     parser.add_argument("--num_iters", type=int, default=10,
                         help="Number of weight-shared message-passing iterations (BP-like fixed-point depth)")
     parser.add_argument("--time_emb_dim", type=int, default=32)
@@ -202,7 +202,7 @@ def parse_args():
     parser.add_argument("--lr", type=float, default=0.004)
     parser.add_argument("--epochs", type=int, default=1000)
     parser.add_argument("--rank", type=int, required=True)
-    parser.add_argument("--grad_acc", type=int, default=2)
+    # parser.add_argument("--grad_acc", type=int, default=2)
     return parser.parse_args()
 
 def main():
@@ -212,7 +212,7 @@ def main():
 
     betas_schedule = get_cosine_schedule(args.timesteps)
     if args.discrete:
-        process = D3PMProcess(betas=betas_schedule, device=device, lambda_aux=0.1, lambda_mk=0.1)
+        process = D3PMProcess(betas=betas_schedule, device=device, lambda_aux=0.1, lambda_mk=0.0)
     else:
         process = ContinuousVPSDE(betas=betas_schedule, device=device)
 
@@ -221,7 +221,9 @@ def main():
         time_emb_dim=args.time_emb_dim,
         discrete=args.discrete,
         num_iters=args.num_iters,
+        damping=0.3
     )
+    print(f"[*] Model parameters: {sum(p.numel() for p in model.parameters())}")
 
     data_dir = os.path.dirname(args.data_path)
     jmat_path = os.path.join(args.data_path, "Jmat.bin")
@@ -242,7 +244,7 @@ def main():
 
     # ds = MyDataset(data, mk.reshape(N, 1), edge_index, edge_weight)
     # ds = torch.load("/mnt/beegfs/2a/sb12724/rfim_learn_fields/processed_dataset_L12.pt")
-    train_ds = MultiFieldIsingDataset(load_path=args.data_path, augment=False)
+    train_ds = MultiFieldIsingDataset(load_path=args.data_path, augment=True)
     val_ds = MultiFieldIsingDataset(load_path=args.validation_path, augment=False) if args.validation_path else None
 
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, num_workers=4, persistent_workers=True)

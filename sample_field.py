@@ -15,6 +15,7 @@ def parse_args():
     parser.add_argument("--checkpoint_path", type=str, required=True, 
                         help="Path to the directory containing config.json and model weights")
     parser.add_argument("--num_samples", type=int, default=8192, help="Total samples to generate")
+    parser.add_argument("--n_tier",type = int,default=6)
     parser.add_argument("--batch_size", type=int, default=2048, help="Max VRAM batch size per GPU")
     parser.add_argument("--load_best", action="store_true", help="Load model_best.pt instead of model_last.pt")
     parser.add_argument("--load_epoch", type=int, default=None, help="Specify epoch to load model from step_checkpoints")
@@ -32,6 +33,7 @@ def main():
 
     # 1. Load Model and Config
     model, config = load_model_from_checkpoint(args.checkpoint_path, device, load_best=args.load_best, epoch=args.load_epoch)
+    model.num_iters = args.n_iter
     diff_config = config["diffusion"]
     train_args = config.get("training_params", {})
     
@@ -129,9 +131,10 @@ def main():
         
         data_raw = data_raw.reshape(-1, N)
         final_spins = final_spins.reshape(-1, N)
-        corr_data = data_raw.T @ data_raw / data_raw.shape[0]
+        data_raw_gpu = torch.from_numpy(data_raw).float().to(device)
+        corr_data = data_raw_gpu.T @ data_raw_gpu / data_raw_gpu.shape[0]
         corr_gen = final_spins.T @ final_spins / final_spins.shape[0]
-        plt.scatter(corr_data.flatten(), corr_gen.cpu().numpy().flatten(), alpha=0.5, s=5)
+        plt.scatter(corr_data.cpu().numpy().flatten(), corr_gen.cpu().numpy().flatten(), alpha=0.5, s=5)
         plt.xlabel("True Correlation")
         plt.ylabel("Generated Correlation")
         plt.title(f"Correlation Matrix Correlation: {method.upper()}")
